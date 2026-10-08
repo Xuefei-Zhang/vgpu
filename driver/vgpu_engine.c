@@ -176,10 +176,12 @@ static void vgpu_engine_work(struct work_struct *work)
  * directly by the engine (ADR-0001), but it keeps exactly those
  * constraints.
  */
+static void vgpu_irq_bh_work(struct work_struct *work);
+
 irqreturn_t vgpu_irq_handler(int irq, void *dev_id)
 {
 	struct vgpu *v = dev_id;
-	struct vgpu_submission *sub;
+	struct vgpu_submission *sub = NULL, *pos;
 	unsigned long flags;
 	u32 status, seqno;
 
@@ -191,14 +193,15 @@ irqreturn_t vgpu_irq_handler(int irq, void *dev_id)
 	}
 	v->regs->status = 0;	/* clear the "interrupt" flag */
 	seqno = v->regs->seqno;
-	sub = NULL;
-	list_for_each_entry(sub, &v->in_flight, node) {
-		if (sub->seqno == seqno)
+	list_for_each_entry(pos, &v->in_flight, node) {
+		if (pos->seqno == seqno) {
+			sub = pos;
 			break;
-		sub = NULL;
+		}
 	}
 	if (sub)
-		v->bh_sub = sub;
+		/* unlinked now: the bottom half processes exactly this sub */
+		list_del_init(&sub->node);
 	spin_unlock_irqrestore(&v->lock, flags);
 
 	if (!sub)
@@ -206,7 +209,8 @@ irqreturn_t vgpu_irq_handler(int irq, void *dev_id)
 
 	dev_info(&v->pdev->dev, "[vgpu:irq] top-half seq#%u -> bottom half\n",
 		 seqno);
-	queue_work(v->irq_wq, &v->irq_work);
+	INIT_WORK(&sub->finish_work, vgpu_irq_bh_work);
+	queue_work(v->irq_wq, &sub->finish_work);
 	return IRQ_HANDLED;
 }
 
@@ -275,19 +279,11 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
  */
 static void vgpu_irq_bh_work(struct work_struct *work)
 {
-	struct vgpu *v = container_of(work, struct vgpu, irq_work);
-	struct vgpu_submission *sub;
-	unsigned long flags;
+	struct vgpu_submission *sub =
+		container_of(work, struct vgpu_submission, finish_work);
+	struct vgpu *v = sub->v;
 
-	spin_lock_irqsave(&v->lock, flags);
-	sub = v->bh_sub;
-	v->bh_sub = NULL;
-	if (sub)
-		list_del_init(&sub->node);
-	spin_unlock_irqrestore(&v->lock, flags);
-	if (!sub)
-		return;
-
+	/* the top half already unlinked sub from in_flight */
 	dev_info(&v->pdev->dev, "[vgpu:bh] seq#%u signaling fence\n",
 		 sub->seqno);
 	vgpu_finish_submission(v, sub);
@@ -343,7 +339,6 @@ void vgpu_engine_init(struct vgpu *v)
 	v->engine_wq = alloc_ordered_workqueue("vgpu-engine", WQ_UNBOUND);
 	v->irq_wq = alloc_ordered_workqueue("vgpu-irq", WQ_UNBOUND);
 	INIT_WORK(&v->engine_work, vgpu_engine_work);
-	INIT_WORK(&v->irq_work, vgpu_irq_bh_work);
 	INIT_WORK(&v->watchdog_work, vgpu_watchdog_work);
 	timer_setup(&v->watchdog, vgpu_watchdog_timer, 0);
 	mod_timer(&v->watchdog, jiffies + VGPU_FENCE_TIMEOUT);

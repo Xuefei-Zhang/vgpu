@@ -78,8 +78,7 @@ struct vgpu {          /* 设备私有 */
     struct drm_device    *dev;
     struct workqueue_struct *engine_wq;   /* “GPU 核心”：执行命令 */
     struct work_struct    engine_work;
-    struct workqueue_struct *irq_wq;      /* 下半部：处理完成 */
-    struct work_struct    irq_work;
+    struct workqueue_struct *irq_wq;      /* 下半部：处理完成（per-sub work） */
     struct vgpu_regs *regs;  dma_addr_t regs_dma;   /* 一致性映射 */
     struct drm_gem_shmem_object *ring_bo; u8 *ring_cpu;  /* Ring = GEM BO */
     u8 *scratch; dma_addr_t scratch_dma;               /* 一致性映射 */
@@ -93,11 +92,13 @@ struct vgpu {          /* 设备私有 */
 
 struct vgpu_submission {
     struct list_head node;
+    struct vgpu *v;               /* finish work 反向指回设备 */
     u32 seqno;
     struct dma_fence fence;       /* vgem 风格：fence + completion */
     u32 ncmds, cmds_off;          /* scratch 内偏移 */
     u32 error;
     struct completion done;       /* rmmod drain 用 */
+    struct work_struct finish_work;  /* 下半部：每个 sub 一个 work */
 };
 ```
 
@@ -134,11 +135,12 @@ engine work（模拟硬件完成）
   └─ regs.status |= DONE; regs.seqno/error = …
   └─ vgpu_irq_handler(0, vgpu)            ← 模拟“硬件中断”（直接调用）
        [上半部：spinlock，禁止睡眠，动作必须短]
-       读 regs.status → 清 DONE → 摘出对应 Submission → queue_work(irq_wq)
+       读 regs.status → 清 DONE → 按 seqno 找到并摘出 Submission（list_del_init）
+       → INIT_WORK(sub->finish_work) → queue_work(irq_wq)
        return IRQ_HANDLED
-  └─ [下半部：irq_wq，进程上下文，可睡眠]
-       dma_fence_signal（唤醒 VGPU_WAIT 等待者）
-       stats_completed++ · ring_used -= · complete(&sub->done) · 释放 scratch 槽
+  └─ [下半部：irq_wq，进程上下文，可睡眠；每个 sub 一个 work，无单槽覆盖]
+       signal 该 sub 的 fence（唤醒 VGPU_WAIT 等待者）
+       stats_completed++ · ring_used -= · 释放 submission
 ```
 
 - 为什么分两半：真实 hardirq 上下文不能睡眠、必须短；上半部只做读状态/清标志/交接，可能慢的动作（fence signal、链表操作、唤醒进程）放下半部。**面试故事 #1**。

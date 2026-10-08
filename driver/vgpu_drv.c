@@ -232,7 +232,7 @@ static void vgpu_drain(struct vgpu *v)
 	unsigned long flags;
 
 	flush_work(&v->engine_work);
-	flush_work(&v->irq_work);
+	flush_workqueue(v->irq_wq);
 
 	spin_lock_irqsave(&v->lock, flags);
 	while (!list_empty(&v->pending) || !list_empty(&v->in_flight)) {
@@ -486,6 +486,8 @@ static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 	struct page *ring_page;
 	void *ring_kmap;
 	u32 bytes;
+	u32 seqno;
+	unsigned long flags;
 	int ret;
 
 	if (arg->ncmds == 0 || arg->ncmds > VGPU_RING_SLOTS)
@@ -499,43 +501,41 @@ static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 	sub = kzalloc(sizeof(*sub), GFP_KERNEL);
 	if (!sub)
 		return -ENOMEM;
+	sub->v = v;
 
 	/* the ring is one pinned shmem page; kmap it for the fetch */
 	ring_page = v->ring_bo->pages[0];
 	ring_kmap = kmap_local_page(ring_page);
 
-	{
-		unsigned long flags;
-
-		spin_lock_irqsave(&v->lock, flags);
-		if (v->ring_used + bytes > VGPU_RING_SIZE ||
-		    v->scratch_used + bytes > VGPU_SCRATCH_SIZE) {
-			spin_unlock_irqrestore(&v->lock, flags);
-			kunmap_local(ring_kmap);
-			kfree(sub);
-			return -EBUSY;	/* ring full */
-		}
-		sub->seqno = v->next_seqno++;
-		sub->ncmds = arg->ncmds;
-		sub->cmds_off = v->scratch_used;
-		sub->submit_jiffies = jiffies;
-		v->ring_used += bytes;
-		v->scratch_used += bytes;
-		/* the "GPU fetch": copy commands ring -> scratch */
-		memcpy(v->scratch + sub->cmds_off,
-		       ring_kmap + arg->ring_off, bytes);
-		list_add_tail(&sub->node, &v->pending);
+	spin_lock_irqsave(&v->lock, flags);
+	if (v->ring_used + bytes > VGPU_RING_SIZE ||
+	    v->scratch_used + bytes > VGPU_SCRATCH_SIZE) {
 		spin_unlock_irqrestore(&v->lock, flags);
+		kunmap_local(ring_kmap);
+		kfree(sub);
+		return -EBUSY;	/* ring full */
 	}
+	sub->seqno = v->next_seqno++;
+	sub->ncmds = arg->ncmds;
+	sub->cmds_off = v->scratch_used;
+	sub->submit_jiffies = jiffies;
+	v->ring_used += bytes;
+	v->scratch_used += bytes;
+	/* the "GPU fetch": copy commands ring -> scratch */
+	memcpy(v->scratch + sub->cmds_off,
+	       ring_kmap + arg->ring_off, bytes);
+	/*
+	 * Not on pending yet: the fence must be published (idr) first,
+	 * otherwise the engine could execute and free sub before it is
+	 * fully set up.
+	 */
+	spin_unlock_irqrestore(&v->lock, flags);
 	kunmap_local(ring_kmap);
 
 	cmds = (struct vgpu_cmd *)(v->scratch + sub->cmds_off);
 	ret = vgpu_resolve_blit(file, cmds, sub->ncmds, sub);
 	if (ret) {
-		unsigned long flags;
-
 		spin_lock_irqsave(&v->lock, flags);
-		list_del_init(&sub->node);
 		v->ring_used -= bytes;
 		v->scratch_used -= bytes;
 		spin_unlock_irqrestore(&v->lock, flags);
@@ -545,10 +545,7 @@ static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 
 	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
 	if (!fence) {
-		unsigned long flags;
-
 		spin_lock_irqsave(&v->lock, flags);
-		list_del_init(&sub->node);
 		v->ring_used -= bytes;
 		v->scratch_used -= bytes;
 		spin_unlock_irqrestore(&v->lock, flags);
@@ -567,12 +564,9 @@ static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 			GFP_KERNEL);
 	mutex_unlock(&v->fence_mutex);
 	if (ret < 0) {
-		unsigned long flags;
-
 		dma_fence_put(&fence->base);
 		kfree(fence);
 		spin_lock_irqsave(&v->lock, flags);
-		list_del_init(&sub->node);
 		v->ring_used -= bytes;
 		v->scratch_used -= bytes;
 		spin_unlock_irqrestore(&v->lock, flags);
@@ -580,12 +574,18 @@ static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 		return ret;
 	}
 
+	/* sub is fully set up and its fence is published: hand it over */
+	seqno = sub->seqno;
+	spin_lock_irqsave(&v->lock, flags);
 	v->stats_submitted++;
+	list_add_tail(&sub->node, &v->pending);
+	spin_unlock_irqrestore(&v->lock, flags);
+
 	dev_info(dev->dev, "[vgpu:cs] seq#%u ring_off=0x%llx ncmds=%u\n",
-		 sub->seqno, (unsigned long long)arg->ring_off, sub->ncmds);
+		 seqno, (unsigned long long)arg->ring_off, arg->ncmds);
 
 	queue_work(v->engine_wq, &v->engine_work);
-	arg->seqno = sub->seqno;
+	arg->seqno = seqno;
 	return 0;
 }
 

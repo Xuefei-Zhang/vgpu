@@ -54,6 +54,7 @@ struct vgpu_fence {
 /* One doorbell: ncmds commands fetched from the ring into scratch. */
 struct vgpu_submission {
 	struct list_head node;
+	struct vgpu *v;		/* back-pointer for the per-sub finish work */
 	u32 seqno;
 	u32 ncmds;
 	u32 cmds_off;		/* offset inside the coherent scratch area */
@@ -66,6 +67,7 @@ struct vgpu_submission {
 	struct page **src_pages, **dst_pages;
 	u32 nblit_pages;
 	u32 blit_off;		/* page index of the blit range inside the BOs */
+	struct work_struct finish_work;	/* bottom half: one work per sub */
 };
 
 struct vgpu {
@@ -77,7 +79,6 @@ struct vgpu {
 	struct work_struct engine_work;
 	/* bottom half: process completions, signal fences */
 	struct workqueue_struct *irq_wq;
-	struct work_struct irq_work;
 	struct work_struct watchdog_work;
 
 	struct vgpu_regs *regs;		/* coherent: virtual BAR0 */
@@ -91,7 +92,6 @@ struct vgpu {
 	spinlock_t lock;		/* ring/scratch bookkeeping + lists */
 	struct list_head pending;	/* submitted, not yet executing */
 	struct list_head in_flight;	/* executing / waiting for "interrupt" */
-	struct vgpu_submission *bh_sub;	/* picked up by the top half */
 	u32 next_seqno;
 	u32 ring_used;
 
