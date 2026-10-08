@@ -1,0 +1,9 @@
+driver/*.o
+driver/*.ko
+driver/*.mod
+driver/*.mod.c
+driver/Module.symvers
+driver/modules.order
+userspace/vgpu_test
+initramfs.cpio.gz
+qemu-console.log

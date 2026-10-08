@@ -1,0 +1,28 @@
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t debugfs none /sys/kernel/debug
+
+# no udev here: create the DRM device nodes from sysfs
+mkdir -p /dev/dri
+mknode() { # $1 = sysfs dev file, $2 = node name
+	dev=$(cat "$1")
+	major=${dev%:*}
+	minor=${dev#*:}
+	if [ ! -e "/dev/dri/$2" ]; then
+		mknod "/dev/dri/$2" c "$major" "$minor" 2>/dev/null || true
+	fi
+}
+echo "[init] vgpu guest up (kernel $(uname -r))"
+if [ -f /root/vgpu.ko ]; then
+	insmod /root/vgpu.ko
+	# nodes only exist after the module probes — create them now (no udev)
+	[ -e /sys/class/drm/card0/dev ] && mknode /sys/class/drm/card0/dev card0
+	[ -e /sys/class/dri/renderD128/dev ] && mknode /sys/class/dri/renderD128/dev renderD128
+	echo "[init] vgpu.ko loaded: $(ls /dev/dri 2>/dev/null)"
+fi
+if [ -f /root/autorun ]; then
+	/root/run_test.sh
+fi
+echo "[init] dropping to shell"
+exec /bin/sh
