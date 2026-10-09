@@ -51,14 +51,29 @@ struct vgpu_fence {
 	unsigned long created_jiffies;	/* for the watchdog */
 };
 
-/* One doorbell: ncmds commands fetched from a queue ring into scratch. */
+/*
+ * One doorbell. Two shapes:
+ *  - CS ioctl (legacy): commands are fetched into scratch at submit
+ *    time, ncmds set, npkts == 0.
+ *  - DOORBELL ioctl (phase B): carries a packet RANGE in the queue
+ *    ring; the engine fetches and decodes it, setting ncmds from npkts.
+ */
 struct vgpu_submission {
 	struct list_head node;		/* engine_pending[] or in_flight */
 	struct vgpu *v;		/* back-pointer for the per-sub finish work */
 	struct vgpu_queue *q;	/* the queue it came from (ring accounting) */
 	u32 seqno;
 	u32 engine;			/* engine the queue was bound to */
-	u32 ncmds;
+	u32 npkts;			/* packets left to fetch (0 once fetched) */
+	u32 ncmds;			/* commands the engine will/did execute */
+	u32 ring_off;		/* byte offset of the first packet */
+	bool from_doorbell;		/* packet path vs legacy CS path */
+	/*
+	 * Ring bytes claimed (packets are 32B, commands are 64B — these
+	 * two sizes are NOT interchangeable: mixing them up makes the
+	 * ring watermark underflow on the packet path).
+	 */
+	u32 ring_bytes;
 	u32 cmds_off;		/* offset inside the coherent scratch area */
 	u32 error;		/* set by the engine, propagated to the fence */
 	u32 finished;		/* cmpxchg guard: finished exactly once */
@@ -91,6 +106,15 @@ struct vgpu_queue {
 	u32 prio;			/* 0 low, 1 normal, 2 high */
 	u32 ring_size;			/* bytes */
 	u32 ring_used;			/* bytes claimed by in-flight work */
+	/*
+	 * The packet ring's read/write offsets (bytes, 32B aligned):
+	 * userspace advances put (implicitly, by writing packets and then
+	 * ringing the doorbell with the new put), the engine advances get
+	 * once the fetch is done. This is the host-side queue descriptor a
+	 * real GPU walks (MQD / GPFIFO entry) — in host memory, written by
+	 * userspace without a syscall in the fast path.
+	 */
+	u32 get, put;
 	u64 fence_context;		/* one timeline per queue */
 	u64 stats_submitted, stats_completed, stats_errors;
 

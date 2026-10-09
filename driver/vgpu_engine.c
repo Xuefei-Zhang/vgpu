@@ -93,8 +93,57 @@ static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
  * (see vgpu_engine_init). engine_pending[] carries the in-order
  * backlog of that engine.
  */
+/*
+ * The fetch. This is the phase-B point: the ENGINE reads the queue's
+ * ring and decodes the packets into commands, instead of the ioctl
+ * having copied them for us. On real hardware this is what the
+ * command processor's front end does when the doorbell rings — the
+ * CPU has already left the building by now.
+ */
+static void vgpu_fetch_packets(struct vgpu *v, struct vgpu_submission *sub)
+{
+	struct vgpu_queue *q = sub->q;
+	struct page *page;
+	struct vgpu_packet *pk;
+	struct vgpu_cmd *cmds;
+	u32 i;
+
+	/* the ring may span pages for larger queues */
+	page = q->ring_bo->pages[sub->ring_off / PAGE_SIZE];
+	pk = kmap_local_page(page) + (sub->ring_off % PAGE_SIZE);
+	cmds = (struct vgpu_cmd *)(v->scratch[sub->engine] + sub->cmds_off);
+
+	for (i = 0; i < sub->npkts; i++) {
+		struct vgpu_cmd *c = &cmds[i];
+
+		memset(c, 0, sizeof(*c));
+		switch (pk[i].type) {
+		case VGPU_PKT_NOP:
+			c->opcode = VGPU_OP_NOP;
+			break;
+		case VGPU_PKT_COPY:
+			c->opcode = VGPU_OP_BLIT;
+			c->src_bo = pk[i].src_bo;
+			c->dst_bo = pk[i].dst_bo;
+			c->src_off = pk[i].off;
+			c->dst_off = pk[i].off;
+			c->length = pk[i].len;
+			break;
+		case VGPU_PKT_WRITE_REG:
+			c->opcode = VGPU_OP_SET;
+			c->set_off = pk[i].reg_off;
+			c->set_data = pk[i].reg_val;
+			break;
+		default:
+			c->opcode = 0xff;	/* engine reports the fault */
+		}
+	}
+	kunmap_local(pk);
+}
+
 static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 {
+
 	struct vgpu_cmd *cmds =
 		(struct vgpu_cmd *)(v->scratch[sub->engine] + sub->cmds_off);
 	u32 i;
@@ -192,6 +241,15 @@ static void vgpu_engine_work(struct work_struct *work, int engine)
 		if (!sub)
 			break;
 
+		/*
+		 * Packet submissions carry a ring range, not commands:
+		 * the fetch happens here, in engine context.
+		 */
+		if (sub->npkts) {
+			vgpu_fetch_packets(v, sub);
+			sub->ncmds = sub->npkts;
+			sub->npkts = 0;
+		}
 		vgpu_execute(v, sub);
 
 		/*
@@ -313,7 +371,14 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 		}
 		/* ring space is per queue now: a full queue blocks only
 		 * its own stream, not the whole device */
-		sub->q->ring_used -= sub->ncmds * VGPU_CMD_SIZE;
+		/*
+		 * The queue's read pointer advances only on the packet
+		 * path (get/put exist for the doorbell flow; the legacy
+		 * CS path uses arbitrary ring offsets).
+		 */
+		if (sub->from_doorbell)
+			sub->q->get = sub->ring_off + sub->ring_bytes;
+		sub->q->ring_used -= sub->ring_bytes;
 		v->scratch_used[sub->engine] -= sub->ncmds * VGPU_CMD_SIZE;
 		spin_unlock_irqrestore(&v->lock, flags);
 	}

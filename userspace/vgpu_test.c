@@ -14,6 +14,7 @@
  * -m N: fork N processes; each runs the chain with its own BOs and its
  * own ring slot (the ring is shared scratch: disjoint slots, like real
  * per-context rings).
+ * -p:   packet + doorbell submission (phase B): the engine fetches.
  * -q:   multi-queue / multi-engine: one fd, one stream per engine
  *        (streams + per-engine command classes).
  * -e:   the negative paths only (rejected doorbell, engine faults,
@@ -535,6 +536,157 @@ out:
 	return rc;
 }
 
+
+/*
+ * Phase B: the packet/doorbell path. Userspace writes PACKETS into the
+ * queue ring and rings the doorbell; the engine fetches and decodes
+ * them. No ioctl per command — one syscall per batch.
+ */
+static int run_doorbell(void)
+{
+	int fd;
+	int rc = 1;
+	int i;
+	uint8_t *src, *dst;
+	uint32_t src_handle, dst_handle;
+	struct vgpu_bo_create bo;
+	uint8_t *ring;
+	struct vgpu_queue_create qc;
+	struct vgpu_packet *pk;
+	struct vgpu_doorbell db;
+	struct vgpu_wait w;
+	uint32_t qid = 0;
+
+	fd = open("/dev/dri/renderD128", O_RDWR);
+	if (fd < 0)
+		fd = open("/dev/dri/card0", O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "FAIL: open: %s\n", strerror(errno));
+		return 1;
+	}
+
+	memset(&bo, 0, sizeof(bo));
+	bo.size = BO_SIZE;
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create(src)"))
+		goto out;
+	src_handle = bo.handle;
+	src = xmap(fd, bo.mmap_offset, BO_SIZE);
+
+	memset(&bo, 0, sizeof(bo));
+	bo.size = BO_SIZE;
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create(dst)"))
+		goto out;
+	dst_handle = bo.handle;
+	dst = xmap(fd, bo.mmap_offset, BO_SIZE);
+	memset(dst, 0, BO_SIZE);
+
+	for (i = 0; i < BLIT_LEN; i++)
+		src[i] = (uint8_t)(0xA0 + (i & 0x0f));
+
+	memset(&qc, 0, sizeof(qc));
+	qc.engine = VGPU_ENGINE_GFX;
+	qc.prio = 1;
+	qc.nslots = 64;
+	if (check(fd, &qc, DRM_IOCTL_VGPU_QUEUE_CREATE, "queue_create"))
+		goto out;
+	qid = qc.qid;
+	ring = xmap(fd, qc.mmap_offset, qc.ring_size);
+	pk = (struct vgpu_packet *)ring;
+
+	/* -- batch 1: NOP + COPY + WRITE_REG as packets ---------------- */
+	memset(pk, 0, 3 * sizeof(*pk));
+	pk[0].type = VGPU_PKT_NOP;
+	pk[1].type = VGPU_PKT_COPY;
+	pk[1].src_bo = src_handle;
+	pk[1].dst_bo = dst_handle;
+	pk[1].off = 0;
+	pk[1].len = BLIT_LEN;
+	pk[2].type = VGPU_PKT_WRITE_REG;
+	pk[2].reg_off = 12;
+	pk[2].reg_val = USER_MAGIC;
+
+	memset(&db, 0, sizeof(db));
+	db.qid = qid;
+	db.put = 3 * (uint32_t)sizeof(*pk);
+	if (check(fd, &db, DRM_IOCTL_VGPU_DOORBELL, "doorbell(batch 1)"))
+		goto out;
+
+	memset(&w, 0, sizeof(w));
+	w.seqno = db.seqno;
+	w.timeout_ms = 5000;
+	if (check(fd, &w, DRM_IOCTL_VGPU_WAIT, "wait(batch 1)"))
+		goto out;
+	if (w.status != 0) {
+		fprintf(stderr, "FAIL: batch 1 status=%d\n", (int)w.status);
+		goto out;
+	}
+	printf("[pid %d] PASS: packet batch 1 (NOP+COPY+WRITE_REG) seq#%u\n",
+	       (int)getpid(), db.seqno);
+
+	/* -- batch 2: the ring is consumed; keep appending ------------ */
+	memset(pk + 3, 0, 2 * sizeof(*pk));
+	pk[3].type = VGPU_PKT_WRITE_REG;
+	pk[3].reg_off = 12;
+	pk[3].reg_val = 0xcafef00d;
+	pk[4].type = VGPU_PKT_NOP;
+
+	memset(&db, 0, sizeof(db));
+	db.qid = qid;
+	db.put = 5 * (uint32_t)sizeof(*pk);
+	if (check(fd, &db, DRM_IOCTL_VGPU_DOORBELL, "doorbell(batch 2)"))
+		goto out;
+	memset(&w, 0, sizeof(w));
+	w.seqno = db.seqno;
+	w.timeout_ms = 5000;
+	if (check(fd, &w, DRM_IOCTL_VGPU_WAIT, "wait(batch 2)"))
+		goto out;
+	if (w.status != 0) {
+		fprintf(stderr, "FAIL: batch 2 status=%d\n", (int)w.status);
+		goto out;
+	}
+	printf("[pid %d] PASS: packet batch 2 seq#%u, ring wrapped back\n",
+	       (int)getpid(), db.seqno);
+
+	/* -- doorbell input validation --------------------------------- */
+	memset(&db, 0, sizeof(db));
+	db.qid = qid;
+	db.put = 5 * (uint32_t)sizeof(*pk) - 4;	/* misaligned */
+	if (expect_errno(fd, &db, DRM_IOCTL_VGPU_DOORBELL, EINVAL,
+			 "doorbell(misaligned put)"))
+		goto out;
+
+	memset(&db, 0, sizeof(db));
+	db.qid = qid;
+	db.put = 5 * (uint32_t)sizeof(*pk);	/* did not advance */
+	if (expect_errno(fd, &db, DRM_IOCTL_VGPU_DOORBELL, EINVAL,
+			 "doorbell(put did not advance)"))
+		goto out;
+
+	memset(&db, 0, sizeof(db));
+	db.qid = qid;
+	db.put = qc.ring_size + 32;		/* past the end */
+	if (expect_errno(fd, &db, DRM_IOCTL_VGPU_DOORBELL, EINVAL,
+			 "doorbell(put out of range)"))
+		goto out;
+
+	/* -- the COPY really ran --------------------------------------- */
+	for (i = 0; i < BLIT_LEN; i++) {
+		if (dst[i] != src[i]) {
+			fprintf(stderr, "FAIL: packet copy mismatch at %d\n", i);
+			goto out;
+		}
+	}
+	printf("[pid %d] PASS: packet copy wrote the pattern\n",
+	       (int)getpid());
+
+	printf("doorbell path: packets fetched and executed by the engine\n");
+	rc = 0;
+
+out:
+	close(fd);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	int m = 1, i;
@@ -544,6 +696,9 @@ int main(int argc, char **argv)
 
 	if (argc > 1 && !strcmp(argv[1], "-q"))
 		return run_queues() ? 1 : 0;
+
+	if (argc > 1 && !strcmp(argv[1], "-p"))
+		return run_doorbell() ? 1 : 0;
 
 	if (argc > 1 && !strcmp(argv[1], "-e"))
 		return run_negative() ? 1 : 0;

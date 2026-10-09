@@ -32,6 +32,8 @@ echo "=== multi-queue, multi-engine (one fd, 3 streams) ==="
 /root/vgpu_test -q || exit 1
 echo "--- queues (debugfs) ---"
 cat /sys/kernel/debug/vgpu/queues
+echo "=== doorbell path (packets fetched by the engine) ==="
+/root/vgpu_test -p || exit 1
 echo "=== negative paths (bad handle / engine fault / ring full) ==="
 /root/vgpu_test -e || exit 1
 echo "=== ftrace: function_graph over vgpu_* ==="

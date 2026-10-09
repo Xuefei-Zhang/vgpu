@@ -91,6 +91,40 @@ struct vgpu_ring_get {
 	__u64 mmap_offset;	/* out, for mmap() */
 };
 
+/*
+ * Packets: what the queue's ring actually holds once submissions
+ * become packet streams (phase B). 40 bytes each, so a 4096B ring
+ * holds 102 of them. Note the three sizes that are easy to confuse:
+ * a ring SLOT is 64B (VGPU_CMD_SIZE), a decoded command struct is
+ * 48B, and a packet is 40B — the scratch stride is the slot size. OP_COPY is the old BLIT, OP_WRITE_REG the old
+ * SET. The doorbell (VGPU_DOORBELL) says how far the writer got; the
+ * engine fetches and decodes from there.
+ */
+enum vgpu_packet_type {
+	VGPU_PKT_NOP		= 0,
+	VGPU_PKT_COPY		= 1,	/* BO->BO DMA */
+	VGPU_PKT_WRITE_REG	= 2,	/* write into the MMIO region */
+};
+
+struct vgpu_packet {
+	__u32 type;		/* enum vgpu_packet_type */
+	__u32 src_bo;		/* COPY: GEM handle of the source */
+	__u64 dst_bo;		/* COPY: GEM handle of the destination */
+	__u32 off;		/* COPY: page-aligned offset in both BOs */
+	__u32 len;		/* COPY: bytes, page aligned, <= 64K */
+	__u32 reg_off;		/* WRITE_REG: byte offset in the MMIO region */
+	__u32 pad;
+	__u64 reg_val;		/* WRITE_REG: value */
+};
+
+/* VGPU_DOORBELL: "the writer has produced packets up to put". */
+struct vgpu_doorbell {
+	__u32 qid;		/* in, target queue */
+	__u32 put;		/* in, byte offset in the queue ring */
+	__u32 seqno;		/* out, sequence number for VGPU_WAIT */
+	__u32 pad;
+};
+
 /* VGPU_CS: the doorbell. Execute ncmds commands starting at ring_off. */
 struct vgpu_cs {
 	__u64 ring_off;	/* in, byte offset of the first command, 64B aligned */
@@ -129,6 +163,7 @@ struct vgpu_query {
 #define DRM_VGPU_QUERY		0x05
 #define DRM_VGPU_QUEUE_CREATE	0x06
 #define DRM_VGPU_QUEUE_DESTROY	0x07
+#define DRM_VGPU_DOORBELL	0x08
 
 #define DRM_IOCTL_VGPU_BO_CREATE	DRM_IOWR(VGPU_IOC(DRM_VGPU_BO_CREATE), struct vgpu_bo_create)
 #define DRM_IOCTL_VGPU_RING_GET		DRM_IOWR(VGPU_IOC(DRM_VGPU_RING_GET), struct vgpu_ring_get)
@@ -137,6 +172,7 @@ struct vgpu_query {
 #define DRM_IOCTL_VGPU_QUERY		DRM_IOWR(VGPU_IOC(DRM_VGPU_QUERY), struct vgpu_query)
 #define DRM_IOCTL_VGPU_QUEUE_CREATE	DRM_IOWR(VGPU_IOC(DRM_VGPU_QUEUE_CREATE), struct vgpu_queue_create)
 #define DRM_IOCTL_VGPU_QUEUE_DESTROY	DRM_IOWR(VGPU_IOC(DRM_VGPU_QUEUE_DESTROY), struct vgpu_queue_destroy)
+#define DRM_IOCTL_VGPU_DOORBELL		DRM_IOWR(VGPU_IOC(DRM_VGPU_DOORBELL), struct vgpu_doorbell)
 
 #if defined(__cplusplus)
 }

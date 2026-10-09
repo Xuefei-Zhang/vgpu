@@ -33,6 +33,8 @@ static int vgpu_queue_create_ioctl(struct drm_device *dev, void *data,
 				   struct drm_file *file);
 static int vgpu_queue_destroy_ioctl(struct drm_device *dev, void *data,
 				    struct drm_file *file);
+static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
+			       struct drm_file *file);
 static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 			 struct drm_file *file);
 static int vgpu_wait_ioctl(struct drm_device *dev, void *data,
@@ -48,6 +50,7 @@ static const struct drm_ioctl_desc vgpu_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(VGPU_QUERY, vgpu_query_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(VGPU_QUEUE_CREATE, vgpu_queue_create_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(VGPU_QUEUE_DESTROY, vgpu_queue_destroy_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VGPU_DOORBELL, vgpu_doorbell_ioctl, DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(vgpu_drm_fops);
@@ -822,6 +825,183 @@ err_put:
 }
 
 /*
+ * VGPU_DOORBELL: phase B's submission path.
+ *
+ * Userspace writes PACKETS into the queue's ring (mmap, no syscall per
+ * packet) and then rings the doorbell with the new put offset. The
+ * kernel does NOT fetch here: it validates the packet range, resolves
+ * the buffer handles (this needs the drm_file, and real drivers also
+ * validate in submit context), publishes the fence, and hands the
+ * packet RANGE to the engine. The engine then does the fetch and the
+ * decode — the "hardware" reads the queue, not the syscall. That is
+ * the whole point of the phase: per-packet syscalls would cost more
+ * than the work itself.
+ */
+static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
+			       struct drm_file *file)
+{
+	struct vgpu *v = to_vgpu(dev);
+	struct vgpu_doorbell *arg = data;
+	struct vgpu_file *vf = file->driver_priv;
+	struct vgpu_submission *sub;
+	struct vgpu_queue *q;
+	struct vgpu_fence *fence;
+	struct vgpu_packet *pk;
+	struct page *ring_page;
+	u32 bytes, i, ncopies = 0;
+	unsigned long flags;
+	int ret;
+
+	if (!vf)
+		return -EINVAL;
+
+	spin_lock_irqsave(&v->lock, flags);
+	q = arg->qid ? vgpu_queue_find(vf, arg->qid) : vf->default_q;
+	spin_unlock_irqrestore(&v->lock, flags);
+	if (!q)
+		return -ENOENT;
+
+	/* the doorbell may only move put forward, 32B-aligned, in range */
+	if (arg->put % sizeof(struct vgpu_packet) ||
+	    arg->put > q->ring_size || arg->put <= q->get)
+		return -EINVAL;
+
+	sub = kzalloc(sizeof(*sub), GFP_KERNEL);
+	if (!sub)
+		return -ENOMEM;
+	sub->v = v;
+	sub->q = q;
+	sub->engine = q->engine;
+	sub->ring_off = q->get;
+	sub->npkts = (arg->put - q->get) / sizeof(struct vgpu_packet);
+	sub->from_doorbell = true;
+	sub->ring_bytes = sub->npkts * sizeof(struct vgpu_packet);
+
+	/*
+	 * Validate and resolve in submit context (the fd is here, the
+	 * engine work has no fd to look handles up with). Two passes:
+	 * first the cheap per-packet checks (engine classes, packet
+	 * count), then the BLIT resolution — so a rejected doorbell
+	 * leaves nothing pinned behind.
+	 */
+	ring_page = q->ring_bo->pages[sub->ring_off / PAGE_SIZE];
+	pk = kmap_local_page(ring_page) + (sub->ring_off % PAGE_SIZE);
+
+	for (i = 0; i < sub->npkts; i++) {
+		struct vgpu_packet *p = &pk[i];
+
+		switch (p->type) {
+		case VGPU_PKT_NOP:
+			break;
+		case VGPU_PKT_COPY:
+			if (!vgpu_engine_allows(q->engine, VGPU_OP_BLIT) ||
+			    ncopies++) {
+				ret = -EINVAL;
+				goto err_unmap;
+			}
+			break;
+		case VGPU_PKT_WRITE_REG:
+			if (!vgpu_engine_allows(q->engine, VGPU_OP_SET)) {
+				ret = -EINVAL;
+				goto err_unmap;
+			}
+			break;
+		default:
+			ret = -EINVAL;
+			goto err_unmap;
+		}
+	}
+
+	for (i = 0; i < sub->npkts; i++) {
+		struct vgpu_packet *p = &pk[i];
+		struct vgpu_cmd c = {};
+
+		if (p->type != VGPU_PKT_COPY)
+			continue;
+		c.opcode = VGPU_OP_BLIT;
+		c.src_bo = p->src_bo;
+		c.dst_bo = p->dst_bo;
+		c.src_off = p->off;
+		c.dst_off = p->off;
+		c.length = p->len;
+		ret = vgpu_resolve_blit(file, &c, 1, sub);
+		if (ret)
+			goto err_unmap;
+	}
+	kunmap_local(pk);
+
+	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+	if (!fence) {
+		ret = -ENOMEM;
+		goto err_free_sub;
+	}
+
+	spin_lock_irqsave(&v->lock, flags);
+	/*
+	 * Scratch stride is VGPU_CMD_SIZE (64B) per command — NOT
+	 * sizeof(struct vgpu_cmd) (48B) and not sizeof(struct
+	 * vgpu_packet) (40B). The finish path decrements with
+	 * ncmds * VGPU_CMD_SIZE, so the increment must use the very
+	 * same stride; mixing the two sizes underflows the watermark
+	 * (it did: -48 bytes per doorbell batch).
+	 */
+	bytes = sub->npkts * VGPU_CMD_SIZE;
+	if (v->scratch_used[q->engine] + bytes > VGPU_SCRATCH_SIZE) {
+		spin_unlock_irqrestore(&v->lock, flags);
+		ret = -EBUSY;
+		goto err_free_fence;
+	}
+	sub->seqno = v->next_seqno++;
+	sub->cmds_off = v->scratch_used[q->engine];
+	v->scratch_used[q->engine] += bytes;
+	q->ring_used += sub->ring_bytes;
+	q->put = arg->put;	/* the writer's position is now committed */
+	spin_unlock_irqrestore(&v->lock, flags);
+
+	fence->seqno = sub->seqno;
+	fence->created_jiffies = jiffies;
+	spin_lock_init(&fence->lock);
+	dma_fence_init(&fence->base, &vgpu_fence_ops, &fence->lock,
+		       q->fence_context, sub->seqno);
+	dma_fence_get(&fence->base);
+
+	mutex_lock(&v->fence_mutex);
+	ret = idr_alloc(&v->fence_idr, fence, sub->seqno, sub->seqno + 1,
+			GFP_KERNEL);
+	mutex_unlock(&v->fence_mutex);
+	if (ret < 0) {
+		dma_fence_put(&fence->base);
+		kfree(fence);
+		spin_lock_irqsave(&v->lock, flags);
+		v->scratch_used[q->engine] -= bytes;
+		q->ring_used -= sub->ring_bytes;
+		spin_unlock_irqrestore(&v->lock, flags);
+		kfree(sub);
+		return ret;
+	}
+
+	spin_lock_irqsave(&v->lock, flags);
+	v->stats_submitted++;
+	q->stats_submitted++;
+	list_add_tail(&sub->node, &v->engine_pending[q->engine]);
+	spin_unlock_irqrestore(&v->lock, flags);
+
+	queue_work(v->engine_wq[q->engine], &v->engine_work[q->engine]);
+	arg->seqno = sub->seqno;
+	return 0;
+
+err_free_fence:
+	kfree(fence);
+err_free_sub:
+	kfree(sub);
+	return ret;
+err_unmap:
+	kunmap_local(pk);
+	kfree(sub);
+	return ret;
+}
+
+/*
  * VGPU_CS: the doorbell.
  *
  *  1. validate,
@@ -874,6 +1054,7 @@ static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 	sub->v = v;
 	sub->q = q;
 	sub->engine = q->engine;
+	sub->ring_bytes = bytes;
 
 	/* the queue's own ring is one pinned shmem page set; kmap it */
 	ring_page = q->ring_bo->pages[0];
@@ -889,6 +1070,7 @@ static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 	}
 	sub->seqno = v->next_seqno++;
 	sub->ncmds = arg->ncmds;
+	sub->ring_off = arg->ring_off;
 	sub->cmds_off = v->scratch_used[q->engine];
 	sub->submit_jiffies = jiffies;
 	q->ring_used += bytes;
