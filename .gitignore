@@ -7,3 +7,11 @@ driver/modules.order
 userspace/vgpu_test
 initramfs.cpio.gz
 qemu-console.log
+
+# initramfs/root/ is regenerated from scratch by scripts/20-initramfs.sh
+# (busybox rootfs + vgpu.ko + vgpu_test + run_test.sh + /init)
+initramfs/root/
+
+# local agent/tooling state, not project source
+.omc/
+.serena/

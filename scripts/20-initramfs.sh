@@ -28,6 +28,20 @@ echo "=== single process full chain ==="
 /root/vgpu_test || exit 1
 echo "=== 4-process concurrent submission ==="
 /root/vgpu_test -m 4 || exit 1
+echo "=== negative paths (bad handle / engine fault / ring full) ==="
+/root/vgpu_test -e || exit 1
+echo "=== ftrace: function_graph over vgpu_* ==="
+TR=/sys/kernel/debug/tracing
+echo function_graph > "$TR/current_tracer"
+echo 'vgpu_*' > "$TR/set_ftrace_filter"
+echo 'vgpu_*' > "$TR/set_graph_function"
+echo > "$TR/trace"			# clear after the filters, before the run
+echo 1 > "$TR/tracing_on"
+/root/vgpu_test >/dev/null 2>&1 || exit 1
+echo 0 > "$TR/tracing_on"
+echo "trace lines: $(wc -l < "$TR/trace")"
+sed -n '1,50p' "$TR/trace"
+echo nop > "$TR/current_tracer"
 echo "=== debugfs stats ==="
 cat /sys/kernel/debug/vgpu/stats
 echo "--- regs ---"
