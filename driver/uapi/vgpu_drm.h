@@ -45,6 +45,35 @@ enum vgpu_opcodes {
 	VGPU_OP_SET	= 2,	/* write set_data into the MMIO region at set_off */
 };
 
+/*
+ * The device's "engines". A real GPGPU card exposes one command processor
+ * per function (NVIDIA: GR + COPY + NVDEC; AMD: gfx ring + sdma + vcn);
+ * a queue is an in-order stream bound to one engine, which is exactly
+ * what userspace calls a stream (cudaStreamCreate).
+ */
+enum vgpu_engines {
+	VGPU_ENGINE_GFX		= 0,	/* the general engine: NOP/BLIT/SET */
+	VGPU_ENGINE_COPY	= 1,	/* DMA engine: BLIT only */
+	VGPU_ENGINE_COMPUTE	= 2,	/* compute engine: NOP/SET (LAUNCH: phase D) */
+	VGPU_ENGINE_COUNT	= 3,
+};
+
+/* VGPU_QUEUE_CREATE: an in-order command stream on one engine. */
+struct vgpu_queue_create {
+	__u32 engine;		/* in, enum vgpu_engines */
+	__u32 prio;		/* in, 0 = low, 1 = normal, 2 = high */
+	__u32 nslots;		/* in, ring slots, 16..64 */
+	__u32 qid;		/* out, queue id within this fd */
+	__u64 ring_size;	/* out, bytes of the queue's command ring */
+	__u64 mmap_offset;	/* out, mmap() the ring at this offset */
+};
+
+/* VGPU_QUEUE_DESTROY: retire a queue (must have no submissions in flight). */
+struct vgpu_queue_destroy {
+	__u32 qid;		/* in */
+	__u32 pad;
+};
+
 /* VGPU_BO_CREATE: create a shmem-backed GEM object ("VRAM" allocation). */
 struct vgpu_bo_create {
 	__u64 size;		/* in, bytes, >= 4K */
@@ -67,6 +96,7 @@ struct vgpu_cs {
 	__u64 ring_off;	/* in, byte offset of the first command, 64B aligned */
 	__u32 ncmds;		/* in, number of commands (>= 1) */
 	__u32 seqno;		/* out, sequence number of this submission */
+	__u32 qid;		/* in, target queue; 0 = this fd's default queue */
 };
 
 /* VGPU_WAIT: wait for a submission to complete (kernel-side fence wait). */
@@ -97,12 +127,16 @@ struct vgpu_query {
 #define DRM_VGPU_CS		0x03
 #define DRM_VGPU_WAIT		0x04
 #define DRM_VGPU_QUERY		0x05
+#define DRM_VGPU_QUEUE_CREATE	0x06
+#define DRM_VGPU_QUEUE_DESTROY	0x07
 
 #define DRM_IOCTL_VGPU_BO_CREATE	DRM_IOWR(VGPU_IOC(DRM_VGPU_BO_CREATE), struct vgpu_bo_create)
 #define DRM_IOCTL_VGPU_RING_GET		DRM_IOWR(VGPU_IOC(DRM_VGPU_RING_GET), struct vgpu_ring_get)
 #define DRM_IOCTL_VGPU_CS		DRM_IOWR(VGPU_IOC(DRM_VGPU_CS), struct vgpu_cs)
 #define DRM_IOCTL_VGPU_WAIT		DRM_IOWR(VGPU_IOC(DRM_VGPU_WAIT), struct vgpu_wait)
 #define DRM_IOCTL_VGPU_QUERY		DRM_IOWR(VGPU_IOC(DRM_VGPU_QUERY), struct vgpu_query)
+#define DRM_IOCTL_VGPU_QUEUE_CREATE	DRM_IOWR(VGPU_IOC(DRM_VGPU_QUEUE_CREATE), struct vgpu_queue_create)
+#define DRM_IOCTL_VGPU_QUEUE_DESTROY	DRM_IOWR(VGPU_IOC(DRM_VGPU_QUEUE_DESTROY), struct vgpu_queue_destroy)
 
 #if defined(__cplusplus)
 }

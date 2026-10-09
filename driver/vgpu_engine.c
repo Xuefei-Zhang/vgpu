@@ -88,12 +88,15 @@ static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
 
 /*
  * Execute one submission. Runs in the engine workqueue — the
- * "GPU core". Single ordered workqueue: one submission at a time,
- * exactly like a single GPU pipe.
+ * "engine". One ordered workqueue per engine kind: one submission at
+ * a time per engine, but GFX / COPY / COMPUTE run concurrently
+ * (see vgpu_engine_init). engine_pending[] carries the in-order
+ * backlog of that engine.
  */
 static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 {
-	struct vgpu_cmd *cmds = (struct vgpu_cmd *)(v->scratch + sub->cmds_off);
+	struct vgpu_cmd *cmds =
+		(struct vgpu_cmd *)(v->scratch[sub->engine] + sub->cmds_off);
 	u32 i;
 
 	for (i = 0; i < sub->ncmds; i++) {
@@ -128,20 +131,60 @@ static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 		if (sub->error)
 			break;	/* "GPU fault: stop the submission" */
 	}
-	dev_info(&v->pdev->dev, "[vgpu:engine] seq#%u done (%u cmds)%s\n",
-		 sub->seqno, sub->ncmds, sub->error ? " ERROR" : "");
+	dev_info(&v->pdev->dev,
+		 "[vgpu:engine] seq#%u (engine %u) done (%u cmds)%s\n",
+		 sub->seqno, sub->engine, sub->ncmds,
+		 sub->error ? " ERROR" : "");
 }
 
-static void vgpu_engine_work(struct work_struct *work)
+static void vgpu_engine_work(struct work_struct *work, int engine);
+
+static void vgpu_engine_work_gfx(struct work_struct *work)
 {
-	struct vgpu *v = container_of(work, struct vgpu, engine_work);
+	vgpu_engine_work(work, VGPU_ENGINE_GFX);
+}
+
+static void vgpu_engine_work_copy(struct work_struct *work)
+{
+	vgpu_engine_work(work, VGPU_ENGINE_COPY);
+}
+
+static void vgpu_engine_work_compute(struct work_struct *work)
+{
+	vgpu_engine_work(work, VGPU_ENGINE_COMPUTE);
+}
+
+typedef void (*vgpu_engine_work_fn)(struct work_struct *work);
+
+static const vgpu_engine_work_fn engine_work_fns[VGPU_ENGINE_COUNT] = {
+	vgpu_engine_work_gfx,
+	vgpu_engine_work_copy,
+	vgpu_engine_work_compute,
+};
+
+/*
+ * The engine body. NOTE how the container is recovered: the index is
+ * part of the member name (engine_work[engine]), because container_of()
+ * subtracts offsetof(array member [0]) — subtracting offsetof of the
+ * ARRAY BASE for element 1 yields a device pointer off by
+ * index * sizeof(work_struct). That is not theoretical: doing
+ * "container_of(work, struct vgpu, engine_work[0])" plus a runtime
+ * "work - &v->engine_work[0]" index made the GFX engine work and the
+ * COPY engine dereference a neighbouring queue object ("spinlock bad
+ * magic" + KASAN slab-out-of-bounds 40 bytes right of a
+ * sizeof(struct vgpu_queue) region). One wrapper per engine, each
+ * naming its own index, is what real drivers do.
+ */
+static void vgpu_engine_work(struct work_struct *work, int engine)
+{
+	struct vgpu *v = container_of(work, struct vgpu, engine_work[engine]);
 	struct vgpu_submission *sub;
 
-	while (1) {
+	for (;;) {
 		unsigned long flags;
 
 		spin_lock_irqsave(&v->lock, flags);
-		sub = list_first_entry_or_null(&v->pending,
+		sub = list_first_entry_or_null(&v->engine_pending[engine],
 					       struct vgpu_submission, node);
 		if (sub)
 			list_move_tail(&sub->node, &v->in_flight);
@@ -261,12 +304,17 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 		unsigned long flags;
 
 		spin_lock_irqsave(&v->lock, flags);
-		if (sub->error)
+		if (sub->error) {
 			v->stats_errors++;
-		else
+			sub->q->stats_errors++;
+		} else {
 			v->stats_completed++;
-		v->ring_used -= sub->ncmds * VGPU_CMD_SIZE;
-		v->scratch_used -= sub->ncmds * VGPU_CMD_SIZE;
+			sub->q->stats_completed++;
+		}
+		/* ring space is per queue now: a full queue blocks only
+		 * its own stream, not the whole device */
+		sub->q->ring_used -= sub->ncmds * VGPU_CMD_SIZE;
+		v->scratch_used[sub->engine] -= sub->ncmds * VGPU_CMD_SIZE;
 		spin_unlock_irqrestore(&v->lock, flags);
 	}
 	kfree(sub);
@@ -336,9 +384,25 @@ static void vgpu_watchdog_timer(struct timer_list *t)
 
 void vgpu_engine_init(struct vgpu *v)
 {
-	v->engine_wq = alloc_ordered_workqueue("vgpu-engine", WQ_UNBOUND);
+	static const char * const names[VGPU_ENGINE_COUNT] = {
+		"vgpu-engine-gfx", "vgpu-engine-copy", "vgpu-engine-compute",
+	};
+	int i;
+
+	for (i = 0; i < VGPU_ENGINE_COUNT; i++) {
+		/*
+		 * Ordered + unbound: submissions of one engine run one at
+		 * a time (like a single GPU pipe) but any engine may run
+		 * on any CPU — so two engines can overlap in time, which
+		 * the ftrace lesson in FTRACE-GUIDE.md §10 uses as proof.
+		 */
+		v->engine_wq[i] = alloc_ordered_workqueue(names[i],
+							  WQ_UNBOUND);
+		INIT_LIST_HEAD(&v->engine_pending[i]);
+		INIT_WORK(&v->engine_work[i], engine_work_fns[i]);
+	}
+
 	v->irq_wq = alloc_ordered_workqueue("vgpu-irq", WQ_UNBOUND);
-	INIT_WORK(&v->engine_work, vgpu_engine_work);
 	INIT_WORK(&v->watchdog_work, vgpu_watchdog_work);
 	timer_setup(&v->watchdog, vgpu_watchdog_timer, 0);
 	mod_timer(&v->watchdog, jiffies + VGPU_FENCE_TIMEOUT);
@@ -346,6 +410,11 @@ void vgpu_engine_init(struct vgpu *v)
 
 void vgpu_engine_fini(struct vgpu *v)
 {
-	destroy_workqueue(v->engine_wq);
+	int i;
+
+	timer_delete_sync(&v->watchdog);
+	flush_work(&v->watchdog_work);
+	for (i = 0; i < VGPU_ENGINE_COUNT; i++)
+		destroy_workqueue(v->engine_wq[i]);
 	destroy_workqueue(v->irq_wq);
 }

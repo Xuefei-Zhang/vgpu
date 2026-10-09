@@ -28,6 +28,10 @@ echo "=== single process full chain ==="
 /root/vgpu_test || exit 1
 echo "=== 4-process concurrent submission ==="
 /root/vgpu_test -m 4 || exit 1
+echo "=== multi-queue, multi-engine (one fd, 3 streams) ==="
+/root/vgpu_test -q || exit 1
+echo "--- queues (debugfs) ---"
+cat /sys/kernel/debug/vgpu/queues
 echo "=== negative paths (bad handle / engine fault / ring full) ==="
 /root/vgpu_test -e || exit 1
 echo "=== ftrace: function_graph over vgpu_* ==="
