@@ -258,11 +258,15 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 |---|---|---|---|
 | A | 多引擎多队列（stream 语义） | ✅ 已完成并 guest 验证 | `1657cdc` |
 | B | 门铃 + 引擎侧取指（packet 提交） | ✅ 已完成并 guest 验证 | `8ebd16f` |
-| C–J | 见上表 | ⬜ 待开发 | — |
+| D | 计算语义：kernel launch / warp 执行 / 合并率 | ✅ 已完成并 guest 验证 | `f6b9b0c` |
+| C, E–J | 见上表 | ⬜ 待开发 | — |
 
 **已交付内容**：per-fd 多队列（每队列独立 ring + fence timeline + doorbell）、三个引擎（gfx/copy/compute）各自
-ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、debugfs `queues` 视图、
-per-engine scratch/backlog 统计、`-q`/`-p` 测试模式与 autorun 集成。
+ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、7 指令教学 ISA +
+warp 同步执行器 + LAUNCH packet + MODULE_LOAD 模块注册 + broadcast/coalesced/strided 三类访存统计、
+debugfs `queues`/`compute` 视图、`-q`/`-p`/saxpy 测试与 autorun 集成。
+**实例**：`userspace/examples/saxpy.c`——CUDA SAXPY 的 vgpu 对应实现，4096 元素全对；
+入门/测试/trace/实例教学见 `docs/GETTING-STARTED.md`。
 
 **过程中抓到并修复的 4 个真 bug**（都有 guest 证据，写入各自 commit message）：
 1. 自旋锁内调可睡眠 API（`drm_gem_shmem_pin` 的页分配 + `set_pages_array`）
@@ -270,8 +274,8 @@ per-engine scratch/backlog 统计、`-q`/`-p` 测试模式与 autorun 集成。
 3. 设备级 scratch 水位按**完成序**回收——多引擎并发才暴露的分配/回收乱序
 4. **三种尺寸混淆**：ring 槽 64B / command 结构 48B / packet 40B，混用导致 scratch 水位下溢 48B/批
 
-**下一步建议**：C（VMID/VA/页表+显存管理）与 A/B 无依赖，`~/self/wt/c` 工作树已就绪；
-D（计算语义）依赖 B 的 packet 路径（LAUNCH packet 有天然位置）。
+**下一步建议**：C（VMID/VA/页表+显存管理）与 A/B/D 无依赖，`~/self/wt/c` 工作树已就绪；
+E（UVM 迁移）依赖 C+D；F（抢占）依赖 D；G（同步/图）依赖 B；H（fault containment）依赖 C+D。
 
 ## 10. 里程碑总览
 
