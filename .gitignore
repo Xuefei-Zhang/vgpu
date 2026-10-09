@@ -15,3 +15,7 @@ initramfs/root/
 # local agent/tooling state, not project source
 .omc/
 .serena/
+
+# kbuild artifacts (*.cmd) and nested agent state
+*.cmd
+.omc/
