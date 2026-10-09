@@ -206,6 +206,12 @@ static int vgpu_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_devres;
 
+	/*
+	 * One vma offset for the ring BO, shared by all VGPU_RING_GET
+	 * callers (the offset must outlive every fd handle to the ring).
+	 */
+	drm_gem_create_mmap_offset(&v->ring_bo->base);
+
 	platform_set_drvdata(pdev, v);
 	dev_info(&pdev->dev,
 		 "[vgpu:probe] ready: /dev/dri/card%d (renderD128), ring %u bytes\n",
@@ -365,7 +371,7 @@ static int vgpu_ring_get_ioctl(struct drm_device *dev, void *data,
 		drm_gem_object_put(obj);
 		return ret;
 	}
-	drm_gem_create_mmap_offset(obj);
+	/* the vma offset was allocated once in probe */
 	arg->mmap_offset = drm_vma_node_offset_addr(&obj->vma_node);
 
 	dev_info(dev->dev, "[vgpu:ring] fd handle=%u mmap_offset=0x%llx\n",
@@ -663,11 +669,21 @@ static int vgpu_query_ioctl(struct drm_device *dev, void *data,
 
 /*
  * The device itself: no resources (x86, no device tree — the platform
- * bus is the x86 analogue of DT matching, docs/adr/0002). Static:
- * platform_device_register() takes ownership on success.
+ * bus is the x86 analogue of DT matching, docs/adr/0002). Static: the
+ * struct lives in module data for the module's lifetime; the no-op
+ * release keeps device_release() from WARNing (and kfree'ing a
+ * non-slab pointer) when vgpu_exit drops the last reference.
  */
+static void vgpu_device_release(struct device *dev)
+{
+	/* nothing to free: static device */
+}
+
 static struct platform_device vgpu_device = {
 	.name = "vgpu",
+	.dev = {
+		.release = vgpu_device_release,
+	},
 };
 
 static int __init vgpu_init(void)
