@@ -35,6 +35,10 @@ static int vgpu_queue_destroy_ioctl(struct drm_device *dev, void *data,
 				    struct drm_file *file);
 static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 			       struct drm_file *file);
+static int vgpu_module_load_ioctl(struct drm_device *dev, void *data,
+				  struct drm_file *file);
+static int vgpu_module_destroy_ioctl(struct drm_device *dev, void *data,
+				     struct drm_file *file);
 static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 			 struct drm_file *file);
 static int vgpu_wait_ioctl(struct drm_device *dev, void *data,
@@ -51,6 +55,8 @@ static const struct drm_ioctl_desc vgpu_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(VGPU_QUEUE_CREATE, vgpu_queue_create_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(VGPU_QUEUE_DESTROY, vgpu_queue_destroy_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(VGPU_DOORBELL, vgpu_doorbell_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VGPU_MODULE_LOAD, vgpu_module_load_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VGPU_MODULE_DESTROY, vgpu_module_destroy_ioctl, DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(vgpu_drm_fops);
@@ -134,6 +140,42 @@ static int vgpu_dbg_queues_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(vgpu_dbg_queues);
 
+static int vgpu_dbg_compute_show(struct seq_file *s, void *unused)
+{
+	struct vgpu *v = s->private;
+
+	seq_printf(s, "kernels   %llu\n", v->cs_kernels_launched);
+	seq_printf(s, "blocks    %llu\n", v->cs_blocks);
+	seq_printf(s, "warps     %llu\n", v->cs_warps);
+	seq_printf(s, "threads   %llu\n", v->cs_threads);
+	seq_printf(s, "waves     %llu\n", v->cs_waves);
+	/*
+	 * Integer fixed-point on purpose: the kernel builds without SSE
+	 * ("SSE register return with SSE disabled" is what a stray double
+	 * earns you), so percentages are scaled by 10.
+	 */
+	seq_printf(s, "instrs    %llu  (%u.%u per thread)\n", v->cs_instrs,
+		   v->cs_threads ?
+		   (u32)(v->cs_instrs / v->cs_threads) : 0,
+		   v->cs_threads ?
+		   (u32)((v->cs_instrs * 10 / v->cs_threads) % 10) : 0);
+	seq_printf(s, "mem_ops   %llu\n", v->cs_mem_ops);
+	/*
+	 * The memory transaction taxonomy, per warp: broadcast (all
+	 * lanes same word = 1 transaction), coalesced (consecutive
+	 * words = 1), strided (the rest = one per lane).
+	 */
+	seq_printf(s, "broadcast warps    %llu / %llu\n",
+		   v->cs_bcast_warps, v->cs_warps);
+	seq_printf(s, "coalesced warps    %llu / %llu\n",
+		   v->cs_coalesced_warps, v->cs_warps);
+	seq_printf(s, "strided warps      %llu / %llu\n",
+		   v->cs_uncoalesced_warps, v->cs_warps);
+	seq_printf(s, "modelled mem latency %llu ns\n", v->cs_mem_lat_ns);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(vgpu_dbg_compute);
+
 static int vgpu_dbg_pending_show(struct seq_file *s, void *unused)
 {
 	struct vgpu *v = s->private;
@@ -203,6 +245,7 @@ static int vgpu_probe(struct platform_device *pdev)
 	spin_lock_init(&v->lock);
 	INIT_LIST_HEAD(&v->in_flight);
 	INIT_LIST_HEAD(&v->queue_list);
+	INIT_LIST_HEAD(&v->kernel_list);
 	mutex_init(&v->fence_mutex);
 	idr_init(&v->fence_idr);
 	v->next_seqno = 1;	/* dma_fence seqno 0 is reserved */
@@ -240,6 +283,7 @@ static int vgpu_probe(struct platform_device *pdev)
 	v->dbg = debugfs_create_dir("vgpu", NULL);
 	debugfs_create_file("stats", 0444, v->dbg, v, &vgpu_dbg_stats_fops);
 	debugfs_create_file("queues", 0444, v->dbg, v, &vgpu_dbg_queues_fops);
+	debugfs_create_file("compute", 0444, v->dbg, v, &vgpu_dbg_compute_fops);
 	debugfs_create_file("pending", 0444, v->dbg, v, &vgpu_dbg_pending_fops);
 	debugfs_create_file("regs", 0444, v->dbg, v, &vgpu_dbg_regs_fops);
 
@@ -270,14 +314,14 @@ err_devres:
 static bool vgpu_engine_allows(u32 engine, u32 opcode)
 {
 	switch (engine) {
-	case VGPU_ENGINE_GFX:
-		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_BLIT ||
-		       opcode == VGPU_OP_SET;
 	case VGPU_ENGINE_COPY:
 		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_BLIT;
 	case VGPU_ENGINE_COMPUTE:
-		/* LAUNCH lands in phase D; for now compute runs control ops */
-		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_SET;
+		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_SET ||
+		       opcode == VGPU_OP_LAUNCH;
+	case VGPU_ENGINE_GFX:
+		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_BLIT ||
+		       opcode == VGPU_OP_SET || opcode == VGPU_OP_LAUNCH;
 	}
 	return false;
 }
@@ -306,6 +350,38 @@ static void vgpu_queue_free(struct vgpu *v, struct vgpu_queue *q)
 		drm_gem_object_put(&q->ring_bo->base);
 	}
 	kfree(q);
+}
+
+static struct vgpu_kernel *vgpu_kernel_find(struct vgpu_file *vf, u32 kid)
+{
+	struct vgpu_kernel *k;
+
+	list_for_each_entry(k, &vf->kernels, file_node)
+		if (k->kid == kid)
+			return k;
+	return NULL;
+}
+
+static void vgpu_file_free_kernels(struct vgpu_file *vf)
+{
+	struct vgpu_kernel *k, *tmp;
+	unsigned long flags;
+	struct vgpu *v = vf->vf_dev;
+	LIST_HEAD(to_free);
+
+	spin_lock_irqsave(&v->lock, flags);
+	list_for_each_entry_safe(k, tmp, &vf->kernels, file_node) {
+		list_del_init(&k->file_node);
+		list_del_init(&k->node);
+		list_add_tail(&k->node, &to_free);
+	}
+	spin_unlock_irqrestore(&v->lock, flags);
+
+	list_for_each_entry_safe(k, tmp, &to_free, node) {
+		list_del(&k->node);
+		kfree(k->code);
+		kfree(k);
+	}
 }
 
 static void vgpu_file_destroy_all_queues(struct vgpu_file *vf)
@@ -342,6 +418,7 @@ static int vgpu_open(struct drm_device *dev, struct drm_file *file)
 		return -ENOMEM;
 
 	INIT_LIST_HEAD(&vf->queues);
+	INIT_LIST_HEAD(&vf->kernels);
 	vf->default_q = NULL;
 	vf->next_qid = 1;
 	vf->vf_dev = v;
@@ -357,6 +434,7 @@ static void vgpu_postclose(struct drm_device *dev, struct drm_file *file)
 		return;
 
 	vgpu_file_destroy_all_queues(vf);
+	vgpu_file_free_kernels(vf);
 	kfree(vf);
 	file->driver_priv = NULL;
 }
@@ -825,6 +903,90 @@ err_put:
 }
 
 /*
+ * VGPU_MODULE_LOAD: register a compute kernel. The "module" a launch
+ * references — the driver's job is the same as a real one's: validate
+ * the resource request (registers, shared memory), keep a driver-side
+ * copy of the code, and hand out an id the scheduler can look up.
+ */
+static int vgpu_module_load_ioctl(struct drm_device *dev, void *data,
+				  struct drm_file *file)
+{
+	struct vgpu *v = to_vgpu(dev);
+	struct vgpu_module_load *arg = data;
+	struct vgpu_file *vf = file->driver_priv;
+	struct vgpu_kernel *k;
+	unsigned long flags;
+
+	if (!vf)
+		return -EINVAL;
+	if (arg->nregs < 1 || arg->nregs > VGPU_NREGS_MAX ||
+	    arg->smem > 4096 || arg->ninstr < 1 || arg->ninstr > 64 ||
+	    !arg->code)
+		return -EINVAL;
+
+	k = kzalloc(sizeof(*k), GFP_KERNEL);
+	if (!k)
+		return -ENOMEM;
+	k->code = kcalloc(arg->ninstr, sizeof(struct vgpu_instr), GFP_KERNEL);
+	if (!k->code) {
+		kfree(k);
+		return -ENOMEM;
+	}
+	if (copy_from_user(k->code, u64_to_user_ptr(arg->code),
+			   arg->ninstr * sizeof(struct vgpu_instr))) {
+		kfree(k->code);
+		kfree(k);
+		return -EFAULT;
+	}
+
+	k->nregs = arg->nregs;
+	k->smem = arg->smem;
+	k->ninstr = arg->ninstr;
+	INIT_LIST_HEAD(&k->node);
+	INIT_LIST_HEAD(&k->file_node);
+
+	spin_lock_irqsave(&v->lock, flags);
+	k->kid = vf->next_kid++;
+	list_add_tail(&k->file_node, &vf->kernels);
+	list_add_tail(&k->node, &v->kernel_list);
+	spin_unlock_irqrestore(&v->lock, flags);
+
+	arg->kid = k->kid;
+	dev_info(dev->dev,
+		 "[vgpu:module] kid=%u nregs=%u smem=%u instrs=%u\n",
+		 k->kid, k->nregs, k->smem, k->ninstr);
+	return 0;
+}
+
+static int vgpu_module_destroy_ioctl(struct drm_device *dev, void *data,
+				     struct drm_file *file)
+{
+	struct vgpu *v = to_vgpu(dev);
+	struct vgpu_module_destroy *arg = data;
+	struct vgpu_file *vf = file->driver_priv;
+	struct vgpu_kernel *k;
+	unsigned long flags;
+
+	if (!vf)
+		return -EINVAL;
+
+	spin_lock_irqsave(&v->lock, flags);
+	k = vgpu_kernel_find(vf, arg->kid);
+	if (!k) {
+		spin_unlock_irqrestore(&v->lock, flags);
+		return -ENOENT;
+	}
+	list_del_init(&k->file_node);
+	list_del_init(&k->node);
+	spin_unlock_irqrestore(&v->lock, flags);
+
+	dev_info(dev->dev, "[vgpu:module] kid=%u destroyed\n", arg->kid);
+	kfree(k->code);
+	kfree(k);
+	return 0;
+}
+
+/*
  * VGPU_DOORBELL: phase B's submission path.
  *
  * Userspace writes PACKETS into the queue's ring (mmap, no syscall per
@@ -848,7 +1010,8 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 	struct vgpu_fence *fence;
 	struct vgpu_packet *pk;
 	struct page *ring_page;
-	u32 bytes, i, ncopies = 0;
+	u32 bytes, i, ncopies = 0, nlaunches = 0;
+	struct vgpu_kernel *kernel = NULL;
 	unsigned long flags;
 	int ret;
 
@@ -906,6 +1069,26 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 				goto err_unmap;
 			}
 			break;
+		case VGPU_PKT_LAUNCH: {
+			u32 kid = p->launch.kid;
+
+			kernel = vgpu_kernel_find(vf, kid);
+			if (!kernel ||
+			    !vgpu_engine_allows(q->engine, VGPU_OP_LAUNCH) ||
+			    nlaunches++ ||
+			    p->launch.block > 256 ||
+			    p->launch.block % 32 ||
+			    p->launch.grid < 1 ||
+			    p->launch.args_off % 4) {
+				ret = -EINVAL;
+				goto err_unmap;
+			}
+			sub->kernel = kernel;
+			sub->grid = p->launch.grid;
+			sub->block = p->launch.block;
+			sub->args_off = p->launch.args_off;
+			break;
+		}
 		default:
 			ret = -EINVAL;
 			goto err_unmap;
@@ -916,14 +1099,37 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 		struct vgpu_packet *p = &pk[i];
 		struct vgpu_cmd c = {};
 
+		if (p->type == VGPU_PKT_LAUNCH) {
+			/* the argument buffer: the kernel's global memory */
+			sub->args_obj = drm_gem_object_lookup(file,
+							      p->launch.args_bo);
+			if (!sub->args_obj) {
+				ret = -ENOENT;
+				goto err_unmap;
+			}
+			/*
+			 * Pin for the submission's lifetime: the engine
+			 * resolves each memory access through the BO's
+			 * pages, and a driver must guarantee they are
+			 * still there (this is what "validate and pin at
+			 * submit" means everywhere in the DRM world).
+			 */
+			ret = drm_gem_shmem_pin(to_drm_gem_shmem_obj(sub->args_obj));
+			if (ret) {
+				drm_gem_object_put(sub->args_obj);
+				sub->args_obj = NULL;
+				goto err_unmap;
+			}
+			continue;
+		}
 		if (p->type != VGPU_PKT_COPY)
 			continue;
 		c.opcode = VGPU_OP_BLIT;
-		c.src_bo = p->src_bo;
-		c.dst_bo = p->dst_bo;
-		c.src_off = p->off;
-		c.dst_off = p->off;
-		c.length = p->len;
+		c.src_bo = p->copy.src_bo;
+		c.dst_bo = p->copy.dst_bo;
+		c.src_off = p->copy.off;
+		c.dst_off = p->copy.off;
+		c.length = p->copy.len;
 		ret = vgpu_resolve_blit(file, &c, 1, sub);
 		if (ret)
 			goto err_unmap;
@@ -997,6 +1203,8 @@ err_free_sub:
 	return ret;
 err_unmap:
 	kunmap_local(pk);
+	if (sub->args_obj)
+		drm_gem_object_put(sub->args_obj);
 	kfree(sub);
 	return ret;
 }

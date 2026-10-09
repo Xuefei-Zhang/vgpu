@@ -85,6 +85,12 @@ struct vgpu_submission {
 	u32 nblit_pages;
 	u32 blit_off;		/* page index of the blit range inside the BOs */
 	struct work_struct finish_work;	/* bottom half: one work per sub */
+
+	/* compute: a LAUNCH packet resolved at submit time */
+	struct vgpu_kernel *kernel;
+	struct drm_gem_object *args_obj;	/* the argument buffer (pinned) */
+	u32 args_off;
+	u32 grid, block;
 };
 
 /*
@@ -123,12 +129,30 @@ struct vgpu_queue {
 	bool destroyed;			/* set by QUEUE_DESTROY; drained */
 };
 
+/*
+ * A loaded compute kernel: the "module" a launch references. The code
+ * is our tiny ISA (see uapi); the driver is the loader/scheduler for
+ * it, exactly like a real driver loads a compute module and schedules
+ * its grids.
+ */
+struct vgpu_kernel {
+	struct list_head node;
+	struct list_head file_node;
+	u32 kid;
+	u32 nregs;
+	u32 smem;
+	u32 ninstr;
+	struct vgpu_instr *code;	/* driver-side copy, ninstr entries */
+};
+
 /* Per-fd state: every open() owns its queues (drm_file.driver_priv). */
 struct vgpu_file {
 	struct list_head queues;	/* struct vgpu_queue */
+	struct list_head kernels;	/* struct vgpu_kernel */
 	struct vgpu_queue *default_q;	/* lazily created GFX queue (qid 0) */
 	struct vgpu *vf_dev;
 	u32 next_qid;
+	u32 next_kid;
 };
 
 struct vgpu {
@@ -180,9 +204,22 @@ struct vgpu {
 
 	u64 stats_submitted, stats_completed, stats_errors;
 	struct dentry *dbg;
+
+	/* compute statistics (debugfs "compute") */
+	u64 cs_kernels_launched, cs_blocks, cs_warps, cs_threads;
+	u64 cs_instrs, cs_mem_ops, cs_waves;
+	u64 cs_coalesced_warps, cs_bcast_warps, cs_uncoalesced_warps;
+	u64 cs_mem_lat_ns;		/* modelled memory latency, ns */
+	struct list_head kernel_list;	/* every live kernel (debugfs) */
 };
 
 #define to_vgpu(drm_dev) container_of(drm_dev, struct vgpu, dev)
+
+#define VGPU_NREGS_MAX		16
+
+/* vgpu_compute.c */
+struct vgpu_instr;
+void vgpu_compute_run(struct vgpu *v, struct vgpu_submission *sub);
 
 /* vgpu_engine.c */
 extern const struct dma_fence_ops vgpu_fence_ops;

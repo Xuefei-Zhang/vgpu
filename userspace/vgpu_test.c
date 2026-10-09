@@ -597,13 +597,13 @@ static int run_doorbell(void)
 	memset(pk, 0, 3 * sizeof(*pk));
 	pk[0].type = VGPU_PKT_NOP;
 	pk[1].type = VGPU_PKT_COPY;
-	pk[1].src_bo = src_handle;
-	pk[1].dst_bo = dst_handle;
-	pk[1].off = 0;
-	pk[1].len = BLIT_LEN;
+	pk[1].copy.src_bo = src_handle;
+	pk[1].copy.dst_bo = dst_handle;
+	pk[1].copy.off = 0;
+	pk[1].copy.len = BLIT_LEN;
 	pk[2].type = VGPU_PKT_WRITE_REG;
-	pk[2].reg_off = 12;
-	pk[2].reg_val = USER_MAGIC;
+	pk[2].reg.reg_off = 12;
+	pk[2].reg.reg_val = USER_MAGIC;
 
 	memset(&db, 0, sizeof(db));
 	db.qid = qid;
@@ -626,8 +626,8 @@ static int run_doorbell(void)
 	/* -- batch 2: the ring is consumed; keep appending ------------ */
 	memset(pk + 3, 0, 2 * sizeof(*pk));
 	pk[3].type = VGPU_PKT_WRITE_REG;
-	pk[3].reg_off = 12;
-	pk[3].reg_val = 0xcafef00d;
+	pk[3].reg.reg_off = 12;
+	pk[3].reg.reg_val = 0xcafef00d;
 	pk[4].type = VGPU_PKT_NOP;
 
 	memset(&db, 0, sizeof(db));

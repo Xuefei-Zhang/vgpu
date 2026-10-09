@@ -18,6 +18,7 @@ for c in sh insmod rmmod ls cat echo mount sleep printf true false \
 done
 cp "$ROOT/driver/vgpu.ko" "$INITDIR/root/"
 cp "$ROOT/userspace/vgpu_test" "$INITDIR/root/"
+[ -f "$ROOT/userspace/examples/saxpy" ] && cp "$ROOT/userspace/examples/saxpy" "$INITDIR/root/"
 # autorun marker (if present next to the scripts) triggers the test on boot
 [ -f "$ROOT/autorun" ] && touch "$INITDIR/root/autorun"
 
@@ -34,6 +35,10 @@ echo "--- queues (debugfs) ---"
 cat /sys/kernel/debug/vgpu/queues
 echo "=== doorbell path (packets fetched by the engine) ==="
 /root/vgpu_test -p || exit 1
+echo "=== compute: saxpy kernel launch (the CUDA example) ==="
+/root/saxpy || exit 1
+echo "--- compute stats ---"
+cat /sys/kernel/debug/vgpu/compute
 echo "=== negative paths (bad handle / engine fault / ring full) ==="
 /root/vgpu_test -e || exit 1
 echo "=== ftrace: function_graph over vgpu_* ==="

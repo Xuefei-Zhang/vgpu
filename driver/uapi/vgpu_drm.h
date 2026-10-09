@@ -43,6 +43,50 @@ enum vgpu_opcodes {
 	VGPU_OP_NOP	= 0,	/* no-op; burns a few us so it shows in ftrace */
 	VGPU_OP_BLIT	= 1,	/* DMA copy: src_bo@src_off -> dst_bo@dst_off */
 	VGPU_OP_SET	= 2,	/* write set_data into the MMIO region at set_off */
+	VGPU_OP_LAUNCH	= 3,	/* run a compute kernel (phase D: grid x block) */
+};
+
+/*
+ * The vgpu "compute ISA" — deliberately tiny (7 instructions). Not a
+ * real SASS/PTX: the point is to learn what a KERNEL LAUNCH is
+ * (grid/block/warps, register file, memory ops) and what the driver
+ * does with one, not to build a compiler.
+ *
+ * Register file: 16 x u32 per thread. r0 is preloaded with the global
+ * thread id. Memory: the kernel's argument BO, word addressed; LD/ST
+ * address = (reg[a] + b) as a WORD index into that BO.
+ */
+enum vgpu_isa_op {
+	VGPU_ISA_MOVI	= 0,	/* rd = a (immediate) */
+	VGPU_ISA_ADD	= 1,	/* rd = reg[a] + reg[b] */
+	VGPU_ISA_MUL	= 2,	/* rd = reg[a] * reg[b] */
+	VGPU_ISA_FMA	= 3,	/* rd = reg[a] * reg[b] + reg[c(dst)]... see layout */
+	VGPU_ISA_LD	= 4,	/* rd = mem[(reg[a] + b) words] */
+	VGPU_ISA_ST	= 5,	/* mem[(reg[a] + b) words] = reg[dst] */
+	VGPU_ISA_EXIT	= 6,
+};
+
+/* one instruction: 16 bytes */
+struct vgpu_instr {
+	__u32 op;
+	__u32 dst;
+	__u32 a;
+	__u32 b;
+};
+
+/* VGPU_MODULE_LOAD: register a kernel (the "compute module"). */
+struct vgpu_module_load {
+	__u32 nregs;		/* in, registers per thread (<= 16) */
+	__u32 smem;		/* in, shared memory per block (<= 4096) */
+	__u32 ninstr;		/* in, number of instructions */
+	__u32 kid;		/* out, kernel id within this fd */
+	__u64 code;		/* in, userspace pointer: ninstr * 16 bytes */
+};
+
+/* VGPU_MODULE_DESTROY: retire a kernel. */
+struct vgpu_module_destroy {
+	__u32 kid;		/* in */
+	__u32 pad;
 };
 
 /*
@@ -104,17 +148,37 @@ enum vgpu_packet_type {
 	VGPU_PKT_NOP		= 0,
 	VGPU_PKT_COPY		= 1,	/* BO->BO DMA */
 	VGPU_PKT_WRITE_REG	= 2,	/* write into the MMIO region */
+	VGPU_PKT_LAUNCH		= 3,	/* run a compute kernel */
 };
 
 struct vgpu_packet {
 	__u32 type;		/* enum vgpu_packet_type */
-	__u32 src_bo;		/* COPY: GEM handle of the source */
-	__u64 dst_bo;		/* COPY: GEM handle of the destination */
-	__u32 off;		/* COPY: page-aligned offset in both BOs */
-	__u32 len;		/* COPY: bytes, page aligned, <= 64K */
-	__u32 reg_off;		/* WRITE_REG: byte offset in the MMIO region */
-	__u32 pad;
-	__u64 reg_val;		/* WRITE_REG: value */
+	union {
+		struct {
+			__u32 src_bo;	/* GEM handle of the source */
+			__u64 dst_bo;	/* GEM handle of the destination */
+			__u32 off;	/* page-aligned offset in both BOs */
+			__u32 len;	/* bytes, page aligned, <= 64K */
+		} copy;
+		struct {
+			__u32 reg_off;	/* byte offset in the MMIO region */
+			__u32 pad;
+			__u64 reg_val;	/* value */
+		} reg;
+		/*
+		 * LAUNCH: the kernel descriptor a GPGPU driver receives
+		 * for every kernel launch (grid/block dims, the argument
+		 * buffer, the kernel to run).
+		 */
+		struct {
+			__u32 kid;	/* kernel id (VGPU_MODULE_LOAD) */
+			__u32 grid;	/* blocks in the grid */
+			__u32 block;	/* threads per block (<= 256) */
+			__u32 args_bo;	/* GEM handle of the argument buffer */
+			__u32 args_off;	/* byte offset of the args inside it */
+			__u32 pad[3];
+		} launch;
+	};
 };
 
 /* VGPU_DOORBELL: "the writer has produced packets up to put". */
@@ -164,6 +228,8 @@ struct vgpu_query {
 #define DRM_VGPU_QUEUE_CREATE	0x06
 #define DRM_VGPU_QUEUE_DESTROY	0x07
 #define DRM_VGPU_DOORBELL	0x08
+#define DRM_VGPU_MODULE_LOAD	0x09
+#define DRM_VGPU_MODULE_DESTROY	0x0a
 
 #define DRM_IOCTL_VGPU_BO_CREATE	DRM_IOWR(VGPU_IOC(DRM_VGPU_BO_CREATE), struct vgpu_bo_create)
 #define DRM_IOCTL_VGPU_RING_GET		DRM_IOWR(VGPU_IOC(DRM_VGPU_RING_GET), struct vgpu_ring_get)
@@ -173,6 +239,8 @@ struct vgpu_query {
 #define DRM_IOCTL_VGPU_QUEUE_CREATE	DRM_IOWR(VGPU_IOC(DRM_VGPU_QUEUE_CREATE), struct vgpu_queue_create)
 #define DRM_IOCTL_VGPU_QUEUE_DESTROY	DRM_IOWR(VGPU_IOC(DRM_VGPU_QUEUE_DESTROY), struct vgpu_queue_destroy)
 #define DRM_IOCTL_VGPU_DOORBELL		DRM_IOWR(VGPU_IOC(DRM_VGPU_DOORBELL), struct vgpu_doorbell)
+#define DRM_IOCTL_VGPU_MODULE_LOAD	DRM_IOWR(VGPU_IOC(DRM_VGPU_MODULE_LOAD), struct vgpu_module_load)
+#define DRM_IOCTL_VGPU_MODULE_DESTROY	DRM_IOWR(VGPU_IOC(DRM_VGPU_MODULE_DESTROY), struct vgpu_module_destroy)
 
 #if defined(__cplusplus)
 }

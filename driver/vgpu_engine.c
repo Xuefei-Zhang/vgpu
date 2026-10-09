@@ -123,16 +123,19 @@ static void vgpu_fetch_packets(struct vgpu *v, struct vgpu_submission *sub)
 			break;
 		case VGPU_PKT_COPY:
 			c->opcode = VGPU_OP_BLIT;
-			c->src_bo = pk[i].src_bo;
-			c->dst_bo = pk[i].dst_bo;
-			c->src_off = pk[i].off;
-			c->dst_off = pk[i].off;
-			c->length = pk[i].len;
+			c->src_bo = pk[i].copy.src_bo;
+			c->dst_bo = pk[i].copy.dst_bo;
+			c->src_off = pk[i].copy.off;
+			c->dst_off = pk[i].copy.off;
+			c->length = pk[i].copy.len;
 			break;
 		case VGPU_PKT_WRITE_REG:
 			c->opcode = VGPU_OP_SET;
-			c->set_off = pk[i].reg_off;
-			c->set_data = pk[i].reg_val;
+			c->set_off = pk[i].reg.reg_off;
+			c->set_data = pk[i].reg.reg_val;
+			break;
+		case VGPU_PKT_LAUNCH:
+			c->opcode = VGPU_OP_LAUNCH;
 			break;
 		default:
 			c->opcode = 0xff;	/* engine reports the fault */
@@ -172,6 +175,9 @@ static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 				break;
 			}
 			vgpu_blit(v, sub);
+			break;
+		case VGPU_OP_LAUNCH:
+			vgpu_compute_run(v, sub);
 			break;
 		default:
 			if (!sub->error)
@@ -329,7 +335,12 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 	if (cmpxchg(&sub->finished, 0, 1))
 		return;
 
-	/* release the BLIT buffers (pins + page refs + object refs) */
+	/* release the launch's argument buffer (unpin + object ref) */
+	if (sub->args_obj) {
+		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
+		drm_gem_object_put(sub->args_obj);
+		sub->args_obj = NULL;
+	}
 	if (sub->src_obj) {
 		u32 i;
 
