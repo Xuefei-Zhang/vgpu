@@ -643,7 +643,13 @@ static int vgpu_wait_ioctl(struct drm_device *dev, void *data,
 	if (!dma_fence_wait_timeout(fence, true, timeout)) {
 		arg->status = -ETIMEDOUT;
 	} else {
-		arg->status = (int)max_t(s64, fence->error, 0);
+		/*
+		 * A dma_fence error is 0 or a negative errno. Surface it
+		 * as-is: clamping with max_t(error, 0) here would swallow
+		 * a failed submission and report success (DESIGN §5:
+		 * status = 0 done, negative = the engine's error).
+		 */
+		arg->status = fence->error < 0 ? (int)fence->error : 0;
 		consumed = true;
 	}
 

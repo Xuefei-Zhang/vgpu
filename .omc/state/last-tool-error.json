@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"pkill -f \\\"self/gpu-driver/initramfs/initramfs.cpio.gz\\\" 2>/dev/null; sleep 1; ps aux | grep qemu-system | grep -v grep | wc -l\",\"description\":\"Stop current guest before rerun\"}",
-  "error": "Exit code 144",
-  "timestamp": "2026-10-08T06:56:12.641Z",
-  "retry_count": 1
-}
