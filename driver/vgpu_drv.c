@@ -346,6 +346,16 @@ static int vgpu_bo_create_ioctl(struct drm_device *dev, void *data,
 	}
 	drm_gem_create_mmap_offset(&shmem->base);
 	arg->mmap_offset = drm_vma_node_offset_addr(&shmem->base.vma_node);
+	/*
+	 * drm_gem_handle_create() took over the creation reference: the
+	 * handle owns it now and releases it when the last handle for
+	 * this object goes away at close time (exynos-style GEM
+	 * refcounting). Drop ours. Without this put the object — and
+	 * its vma offset node — outlives the fd, and the DRM teardown
+	 * finds the node still registered ("Memory manager not clean
+	 * during takedown").
+	 */
+	drm_gem_object_put(&shmem->base);
 
 	dev_info(dev->dev, "[vgpu:gem] bo#%u size=%llu mmap_offset=0x%llx\n",
 		 arg->handle, (unsigned long long)arg->size,
@@ -373,6 +383,12 @@ static int vgpu_ring_get_ioctl(struct drm_device *dev, void *data,
 	}
 	/* the vma offset was allocated once in probe */
 	arg->mmap_offset = drm_vma_node_offset_addr(&obj->vma_node);
+	/*
+	 * The handle holds its own reference from now on; drop the
+	 * temporary one taken above. probe's creation reference is
+	 * separate and is released in vgpu_remove().
+	 */
+	drm_gem_object_put(obj);
 
 	dev_info(dev->dev, "[vgpu:ring] fd handle=%u mmap_offset=0x%llx\n",
 		 arg->handle, (unsigned long long)arg->mmap_offset);
