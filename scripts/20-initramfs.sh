@@ -50,6 +50,16 @@ echo "=== rmmod drain ==="
 rmmod vgpu || exit 1
 lsmod | grep -q '^vgpu' && exit 1
 echo "rmmod: OK (drain path clean)"
+echo "=== reload for interactive use ==="
+insmod /root/vgpu.ko || exit 1
+for n in renderD128 card0; do
+	if [ -e "/sys/class/dri/$n/dev" ]; then sys="/sys/class/dri/$n/dev";
+	elif [ -e "/sys/class/drm/$n/dev" ]; then sys="/sys/class/drm/$n/dev";
+	else continue; fi
+	dev=$(cat "$sys"); rm -f "/dev/dri/$n"
+	mknod "/dev/dri/$n" c "${dev%:*}" "${dev#*:}"
+done
+/root/vgpu_test >/dev/null 2>&1 && echo "device ready: /dev/dri/{card0,renderD128}" || echo "WARN: reload smoke test failed"
 echo "=== all tests passed ==="
 EOF
 chmod +x "$INITDIR/root/run_test.sh"
