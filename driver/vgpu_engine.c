@@ -55,18 +55,19 @@ const struct dma_fence_ops vgpu_fence_ops = {
 /* --------------------------------------------------------------- engine */
 
 /*
- * BLIT: the "GPU" copies src -> dst using the streaming DMA API
- * (dma_map_single / dma_unmap_single), one page at a time. On x86
- * without an IOMMU the mapping is a no-op; with an IOMMU (or on ARM)
- * this is where real device-to-memory translation happens.
+ * The DMA engine: copy npages from one page array to another using the
+ * streaming DMA API (dma_map_single / dma_unmap_single). On x86 without
+ * an IOMMU the mapping is a no-op; with an IOMMU (or on ARM) this is
+ * where real device-to-memory translation happens.
  */
-static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
+static void vgpu_copy_pages(struct vgpu *v, struct page **src,
+			    struct page **dst, u32 npages)
 {
 	u32 i;
 
-	for (i = 0; i < sub->nblit_pages; i++) {
-		struct page *sp = sub->src_pages[sub->blit_off + i];
-		struct page *dp = sub->dst_pages[sub->blit_off + i];
+	for (i = 0; i < npages; i++) {
+		struct page *sp = src[i];
+		struct page *dp = dst[i];
 		void *sv = kmap_local_page(sp);
 		void *dv = kmap_local_page(dp);
 		dma_addr_t saddr, daddr;
@@ -84,6 +85,36 @@ static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
 		kunmap_local(dv);
 		kunmap_local(sv);
 	}
+}
+
+/*
+ * BLIT: BO handles the submitter resolved into page arrays.
+ */
+static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
+{
+	if (!sub->src_obj) {
+		sub->error = -EINVAL;
+		return;
+	}
+	vgpu_copy_pages(v, sub->src_pages + sub->blit_off,
+			sub->dst_pages + sub->blit_off, sub->nblit_pages);
+}
+
+/*
+ * Phase C's DMA: GPU VA -> GPU VA. The pages were already walked out of
+ * this submission's page tables at doorbell time (that is where the fd,
+ * and therefore the VMID, is available), so the engine just moves bytes
+ * — exactly like a real one, which sees DMA addresses, not file
+ * descriptors.
+ */
+static void vgpu_vm_copy(struct vgpu *v, struct vgpu_submission *sub)
+{
+	if (!sub->vm_src_obj) {
+		sub->error = -EINVAL;
+		return;
+	}
+	vgpu_copy_pages(v, sub->vm_src_pages, sub->vm_dst_pages,
+			sub->vm_npages);
 }
 
 /*
@@ -137,6 +168,16 @@ static void vgpu_fetch_packets(struct vgpu *v, struct vgpu_submission *sub)
 		case VGPU_PKT_LAUNCH:
 			c->opcode = VGPU_OP_LAUNCH;
 			break;
+		case VGPU_PKT_VM_COPY:
+			/*
+			 * Phase C: the engine sees GPU addresses, not
+			 * file descriptors — the doorbell already walked
+			 * them into page arrays. All that survives the
+			 * fetch is the opcode; the pages come along in
+			 * the submission.
+			 */
+			c->opcode = VGPU_OP_VM_COPY;
+			break;
 		default:
 			c->opcode = 0xff;	/* engine reports the fault */
 		}
@@ -178,6 +219,9 @@ static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 			break;
 		case VGPU_OP_LAUNCH:
 			vgpu_compute_run(v, sub);
+			break;
+		case VGPU_OP_VM_COPY:
+			vgpu_vm_copy(v, sub);
 			break;
 		default:
 			if (!sub->error)
@@ -337,7 +381,12 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 
 	/* release the launch's argument buffer (unpin + object ref) */
 	if (sub->args_obj) {
-		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
+		/*
+		 * Phase C: a VA-named argument buffer is pinned by its VM
+		 * mapping, not by us — we only borrowed a reference.
+		 */
+		if (sub->args_pinned)
+			drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
 		drm_gem_object_put(sub->args_obj);
 		sub->args_obj = NULL;
 	}
@@ -355,6 +404,8 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 		drm_gem_object_put(sub->src_obj);
 		drm_gem_object_put(sub->dst_obj);
 	}
+	/* phase C: the VA-resolved copy's pages and buffers */
+	vgpu_vm_release_sub(sub);
 
 	mutex_lock(&v->fence_mutex);
 	fence = idr_find(&v->fence_idr, sub->seqno);

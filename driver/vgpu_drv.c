@@ -39,6 +39,12 @@ static int vgpu_module_load_ioctl(struct drm_device *dev, void *data,
 				  struct drm_file *file);
 static int vgpu_module_destroy_ioctl(struct drm_device *dev, void *data,
 				     struct drm_file *file);
+static int vgpu_vm_alloc_ioctl(struct drm_device *dev, void *data,
+			       struct drm_file *file);
+static int vgpu_vm_bind_ioctl(struct drm_device *dev, void *data,
+			      struct drm_file *file);
+static int vgpu_vm_unbind_ioctl(struct drm_device *dev, void *data,
+				struct drm_file *file);
 static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 			 struct drm_file *file);
 static int vgpu_wait_ioctl(struct drm_device *dev, void *data,
@@ -57,6 +63,9 @@ static const struct drm_ioctl_desc vgpu_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(VGPU_DOORBELL, vgpu_doorbell_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(VGPU_MODULE_LOAD, vgpu_module_load_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(VGPU_MODULE_DESTROY, vgpu_module_destroy_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VGPU_VM_ALLOC, vgpu_vm_alloc_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VGPU_VM_BIND, vgpu_vm_bind_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VGPU_VM_UNBIND, vgpu_vm_unbind_ioctl, DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(vgpu_drm_fops);
@@ -205,6 +214,51 @@ static int vgpu_dbg_pending_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(vgpu_dbg_pending);
 
+/*
+ * The phase-C view: per context (VMID), every reserved VA range with
+ * its residency state, and the device's VRAM budget + eviction
+ * counters — the nvidia-smi-shaped half of this phase.
+ *
+ * Writable too: writing a new budget applies it immediately, which is
+ * how the guest test drives eviction without a module parameter.
+ */
+static int vgpu_dbg_vm_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, vgpu_vm_show, inode->i_private);
+}
+
+static ssize_t vgpu_dbg_vm_write(struct file *file, const char __user *ubuf,
+				 size_t len, loff_t *ppos)
+{
+	struct vgpu *v = file->f_inode->i_private;
+	char buf[32];
+	u64 val;
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, len))
+		return -EFAULT;
+	buf[len] = '\0';
+	if (kstrtou64(strim(buf), 0, &val))
+		return -EINVAL;
+
+	mutex_lock(&v->vm_lock);
+	v->vram_budget = val;
+	mutex_unlock(&v->vm_lock);
+	vgpu_vm_evict_all(v);		/* a smaller budget bites at once */
+
+	return len;
+}
+
+static const struct file_operations vgpu_dbg_vm_fops = {
+	.owner	= THIS_MODULE,
+	.open	= vgpu_dbg_vm_open,
+	.read	= seq_read,
+	.write	= vgpu_dbg_vm_write,
+	.llseek	= seq_lseek,
+	.release = single_release,
+};
+
 static int vgpu_dbg_regs_show(struct seq_file *s, void *unused)
 {
 	struct vgpu *v = s->private;
@@ -250,6 +304,14 @@ static int vgpu_probe(struct platform_device *pdev)
 	idr_init(&v->fence_idr);
 	v->next_seqno = 1;	/* dma_fence seqno 0 is reserved */
 
+	/* phase C: the GPU address space / VRAM manager */
+	mutex_init(&v->vm_lock);
+	INIT_LIST_HEAD(&v->vm_list);
+	INIT_LIST_HEAD(&v->vram_lru);
+	ida_init(&v->vm_ida);
+	v->vram_budget = VGPU_VM_VRAM_BUDGET;
+	v->vram_resident = 0;
+
 	/*
 	 * The "BAR0" register file: coherent memory, like a real MMIO
 	 * region must be (CPU and "device" access it at all times).
@@ -286,6 +348,7 @@ static int vgpu_probe(struct platform_device *pdev)
 	debugfs_create_file("compute", 0444, v->dbg, v, &vgpu_dbg_compute_fops);
 	debugfs_create_file("pending", 0444, v->dbg, v, &vgpu_dbg_pending_fops);
 	debugfs_create_file("regs", 0444, v->dbg, v, &vgpu_dbg_regs_fops);
+	debugfs_create_file("vm", 0644, v->dbg, v, &vgpu_dbg_vm_fops);
 
 	ret = drm_dev_register(&v->dev, 0);
 	if (ret)
@@ -315,13 +378,15 @@ static bool vgpu_engine_allows(u32 engine, u32 opcode)
 {
 	switch (engine) {
 	case VGPU_ENGINE_COPY:
-		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_BLIT;
+		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_BLIT ||
+		       opcode == VGPU_OP_VM_COPY;
 	case VGPU_ENGINE_COMPUTE:
 		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_SET ||
 		       opcode == VGPU_OP_LAUNCH;
 	case VGPU_ENGINE_GFX:
 		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_BLIT ||
-		       opcode == VGPU_OP_SET || opcode == VGPU_OP_LAUNCH;
+		       opcode == VGPU_OP_SET || opcode == VGPU_OP_LAUNCH ||
+		       opcode == VGPU_OP_VM_COPY;
 	}
 	return false;
 }
@@ -420,8 +485,11 @@ static int vgpu_open(struct drm_device *dev, struct drm_file *file)
 	INIT_LIST_HEAD(&vf->queues);
 	INIT_LIST_HEAD(&vf->kernels);
 	vf->default_q = NULL;
-	vf->next_qid = 1;
+	vf->vm = NULL;
+	vf->drm_file = file;
 	vf->vf_dev = v;
+	vf->next_qid = 1;
+	vf->next_kid = 1;
 	file->driver_priv = vf;
 	return 0;
 }
@@ -435,6 +503,12 @@ static void vgpu_postclose(struct drm_device *dev, struct drm_file *file)
 
 	vgpu_file_destroy_all_queues(vf);
 	vgpu_file_free_kernels(vf);
+	/*
+	 * Phase C: the fd's GPU address space. Queues first — a queue in
+	 * flight may still be resolving VAs against this VM's tables, and
+	 * destroying the queues drains them.
+	 */
+	vgpu_vm_destroy(vf);
 	kfree(vf);
 	file->driver_priv = NULL;
 }
@@ -510,6 +584,13 @@ static void vgpu_remove(struct platform_device *pdev)
 
 	vgpu_drain(v);
 	drm_dev_unregister(&v->dev);
+
+	/*
+	 * Phase C: any fd still open at rmmod would hold object
+	 * references against a device that is going away.
+	 */
+	vgpu_vm_destroy_all(v);
+	ida_destroy(&v->vm_ida);
 
 	spin_lock_irqsave(&v->lock, flags);
 	s = v->stats_submitted;
@@ -903,6 +984,41 @@ err_put:
 }
 
 /*
+ * Phase C: resolve a VA -> VA DMA at submit time.
+ *
+ * This is where the page-table walk happens, and it has to be here:
+ * the ioctl context is the only one that has the drm_file, and the fd
+ * is what selects the VMID. The engine (workqueue context, no fd) then
+ * just moves bytes between the pages we hand it — which is exactly the
+ * division of labour in a real driver, where the submit path programs
+ * the MMU and the engine sees DMA addresses.
+ *
+ * Both sides take the submission's own object + page references, so an
+ * unbind or an eviction racing the engine cannot pull the pages away.
+ */
+static int vgpu_resolve_vm_copy(struct vgpu_file *vf, struct vgpu_packet *p,
+				struct vgpu_submission *sub)
+{
+	u32 npages = sub->vm_npages;
+	int ret;
+
+	ret = vgpu_vm_resolve(vf, p->vm_copy.src_va, npages, &sub->vm_src_obj,
+			      sub->vm_src_pages);
+	if (ret)
+		return ret;
+
+	ret = vgpu_vm_resolve(vf, p->vm_copy.dst_va, npages, &sub->vm_dst_obj,
+			      sub->vm_dst_pages);
+	if (ret) {
+		vgpu_vm_release(sub->vm_src_obj, sub->vm_src_pages, npages);
+		sub->vm_src_obj = NULL;
+		sub->vm_src_pages = NULL;
+		return ret;
+	}
+	return 0;
+}
+
+/*
  * VGPU_MODULE_LOAD: register a compute kernel. The "module" a launch
  * references — the driver's job is the same as a real one's: validate
  * the resource request (registers, shared memory), keep a driver-side
@@ -1079,7 +1195,8 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 			    p->launch.block > 256 ||
 			    p->launch.block % 32 ||
 			    p->launch.grid < 1 ||
-			    p->launch.args_off % 4) {
+			    p->launch.args_off % 4 ||
+			    p->launch.flags & ~VGPU_PKT_LAUNCH_ARGS_VA) {
 				ret = -EINVAL;
 				goto err_unmap;
 			}
@@ -1087,6 +1204,36 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 			sub->grid = p->launch.grid;
 			sub->block = p->launch.block;
 			sub->args_off = p->launch.args_off;
+			break;
+		}
+		case VGPU_PKT_VM_COPY: {
+			u32 npages;
+
+			if (!vgpu_engine_allows(q->engine, VGPU_OP_VM_COPY) ||
+			    ncopies++) {
+				ret = -EINVAL;
+				goto err_unmap;
+			}
+			if (p->vm_copy.src_va % PAGE_SIZE ||
+			    p->vm_copy.dst_va % PAGE_SIZE ||
+			    p->vm_copy.len == 0 ||
+			    p->vm_copy.len % PAGE_SIZE ||
+			    p->vm_copy.len > VGPU_VM_MAX_COPY_PAGES * PAGE_SIZE) {
+				ret = -EINVAL;
+				goto err_unmap;
+			}
+			npages = p->vm_copy.len / PAGE_SIZE;
+			sub->vm_npages = npages;
+			sub->vm_src_pages = kcalloc(npages,
+						    sizeof(struct page *),
+						    GFP_KERNEL);
+			sub->vm_dst_pages = kcalloc(npages,
+						    sizeof(struct page *),
+						    GFP_KERNEL);
+			if (!sub->vm_src_pages || !sub->vm_dst_pages) {
+				ret = -ENOMEM;
+				goto err_unmap;
+			}
 			break;
 		}
 		default:
@@ -1100,7 +1247,37 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 		struct vgpu_cmd c = {};
 
 		if (p->type == VGPU_PKT_LAUNCH) {
-			/* the argument buffer: the kernel's global memory */
+			/*
+			 * The argument buffer: the kernel's global memory.
+			 * Two ways to name it — a GEM handle (phase D's
+			 * original shape) or a GPU virtual address in the
+			 * SUBMITTING fd's address space, which is what a
+			 * real launch actually passes: the kernel gets a
+			 * device pointer, and the driver has to walk the
+			 * submitter's page tables to find the buffer.
+			 */
+			if (p->launch.flags & VGPU_PKT_LAUNCH_ARGS_VA) {
+				struct drm_gem_object *obj = NULL;
+
+				ret = vgpu_vm_resolve_va(vf,
+						(u64)p->launch.args_bo
+						<< 32 | p->launch.args_off,
+						&obj, &sub->args_off);
+				if (!obj) {
+					ret = -ENOENT;
+					goto err_unmap;
+				}
+				/*
+				 * The mapping keeps the pages resident,
+				 * so all the submission needs is its own
+				 * reference — the same discipline the
+				 * handle case expresses with a pin.
+				 */
+				sub->args_obj = obj;
+				sub->args_pinned = false;
+				continue;
+			}
+
 			sub->args_obj = drm_gem_object_lookup(file,
 							      p->launch.args_bo);
 			if (!sub->args_obj) {
@@ -1120,6 +1297,12 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 				sub->args_obj = NULL;
 				goto err_unmap;
 			}
+			continue;
+		}
+		if (p->type == VGPU_PKT_VM_COPY) {
+			ret = vgpu_resolve_vm_copy(vf, p, sub);
+			if (ret)
+				goto err_unmap;
 			continue;
 		}
 		if (p->type != VGPU_PKT_COPY)
@@ -1203,10 +1386,84 @@ err_free_sub:
 	return ret;
 err_unmap:
 	kunmap_local(pk);
-	if (sub->args_obj)
+	if (sub->args_obj) {
+		if (sub->args_pinned)
+			drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
 		drm_gem_object_put(sub->args_obj);
+	}
+	vgpu_vm_release_sub(sub);
 	kfree(sub);
 	return ret;
+}
+
+/*
+ * VGPU_VM_ALLOC: reserve GPU virtual addresses in this fd's space.
+ *
+ * The VMID is what makes this meaningful: two fds asking for the same
+ * size at the same alignment get the same VA and mean different memory,
+ * because the tag a memory access carries selects the tables.
+ */
+static int vgpu_vm_alloc_ioctl(struct drm_device *dev, void *data,
+			       struct drm_file *file)
+{
+	struct vgpu_vm_alloc *arg = data;
+	struct vgpu_file *vf = file->driver_priv;
+	struct vgpu *v = to_vgpu(dev);
+	struct vgpu_vm *vm;
+	int ret;
+
+	if (!vf || arg->size < PAGE_SIZE)
+		return -EINVAL;
+
+	vm = vgpu_vm_get(vf);
+	if (IS_ERR(vm))
+		return PTR_ERR(vm);
+
+	ret = vgpu_vm_alloc(vf, arg->size, arg->align, &arg->va);
+	if (ret)
+		return ret;
+
+	arg->vmid = vm->vmid;
+	dev_info(&v->pdev->dev,
+		 "[vgpu:vm] vmid %u: reserved va 0x%llx (%llu B)\n",
+		 arg->vmid, (unsigned long long)arg->va,
+		 (unsigned long long)arg->size);
+	return 0;
+}
+
+/*
+ * VGPU_VM_BIND: attach a buffer to a reserved VA range. This is the
+ * moment the buffer's pages become reachable to the device — the PTE
+ * install happens here, and if the device's VRAM budget cannot take
+ * it, someone else's mapping is evicted to make room.
+ */
+static int vgpu_vm_bind_ioctl(struct drm_device *dev, void *data,
+			      struct drm_file *file)
+{
+	struct vgpu_vm_bind *arg = data;
+	struct vgpu_file *vf = file->driver_priv;
+
+	if (!vf)
+		return -EINVAL;
+	return vgpu_vm_bind(vf, arg->va, arg->bo_handle, arg->flags);
+}
+
+/*
+ * VGPU_VM_UNBIND: detach the buffer at va. The VA range itself stays
+ * reserved, so a later bind can reuse it — the same "unmap but keep
+ * the reservation" split that putting a page table entry into an
+ * invalid state (rather than removing the VMA) gives you on a CPU.
+ */
+static int vgpu_vm_unbind_ioctl(struct drm_device *dev, void *data,
+				struct drm_file *file)
+{
+	struct vgpu_vm_unbind *arg = data;
+	struct vgpu_file *vf = file->driver_priv;
+
+	if (!vf)
+		return -EINVAL;
+	vgpu_vm_unbind(vf, arg->va);
+	return 0;
 }
 
 /*

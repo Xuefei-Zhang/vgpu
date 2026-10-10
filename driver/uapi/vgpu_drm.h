@@ -44,6 +44,13 @@ enum vgpu_opcodes {
 	VGPU_OP_BLIT	= 1,	/* DMA copy: src_bo@src_off -> dst_bo@dst_off */
 	VGPU_OP_SET	= 2,	/* write set_data into the MMIO region at set_off */
 	VGPU_OP_LAUNCH	= 3,	/* run a compute kernel (phase D: grid x block) */
+	/*
+	 * Phase C: a DMA between two GPU VIRTUAL addresses. The driver
+	 * resolves both through the submitting fd's page tables, which is
+	 * the same walk a GPU's GCMC/SMMU performs — this is the command
+	 * that makes per-VMID isolation observable from userspace.
+	 */
+	VGPU_OP_VM_COPY	= 4,
 };
 
 /*
@@ -86,6 +93,47 @@ struct vgpu_module_load {
 /* VGPU_MODULE_DESTROY: retire a kernel. */
 struct vgpu_module_destroy {
 	__u32 kid;		/* in */
+	__u32 pad;
+};
+
+/*
+ * Phase C: the GPU virtual memory interface.
+ *
+ * Every fd is one GPU context and gets its own address space with its
+ * own VMID (a real GPU cannot describe the same VA twice — the VMID is
+ * what a memory access is tagged with). A VA range is first RESERVED
+ * (VM_ALLOC) and then a buffer is attached to it (VM_BIND); the pages
+ * become reachable to the device only through that fd's page tables.
+ *
+ *   cudaMalloc        ->  VGPU_BO_CREATE     (host-side shmem BO)
+ *   + VM_ALLOC        ->  a GPU VA in my context
+ *   + VM_BIND         ->  the device can now dereference that VA
+ *   VGPU_PKT_VM_COPY  ->  the walk happens, per page
+ *
+ * Choosing handle-vs-VA is the point: the SAME address in two processes
+ * translatesto different memory because each VMID has its own tables,
+ * and an address nobody bound is a fault, not garbage.
+ */
+struct vgpu_vm_alloc {
+	__u64 size;		/* in, bytes, rounded up to the page size */
+	__u64 align;		/* in, 0 or a power of two >= PAGE_SIZE */
+	__u64 va;		/* out, the start of the reserved range */
+	__u32 vmid;		/* out, this fd's VMID (assigned on first use) */
+	__u32 pad;
+};
+
+/* flags: bit0 = managed (UVM-lite demand migration, phase E). */
+#define VGPU_VM_BIND_MANAGED	BIT(0)
+
+struct vgpu_vm_bind {
+	__u64 va;		/* in, a VA returned by VM_ALLOC */
+	__u32 bo_handle;	/* in, the GEM handle to attach there */
+	__u32 flags;		/* in, VGPU_VM_BIND_* */
+};
+
+/* Detach the buffer at va. The VA range itself stays reserved. */
+struct vgpu_vm_unbind {
+	__u64 va;		/* in */
 	__u32 pad;
 };
 
@@ -149,6 +197,7 @@ enum vgpu_packet_type {
 	VGPU_PKT_COPY		= 1,	/* BO->BO DMA */
 	VGPU_PKT_WRITE_REG	= 2,	/* write into the MMIO region */
 	VGPU_PKT_LAUNCH		= 3,	/* run a compute kernel */
+	VGPU_PKT_VM_COPY	= 4,	/* GPU-VA -> GPU-VA DMA (phase C) */
 };
 
 struct vgpu_packet {
@@ -169,17 +218,39 @@ struct vgpu_packet {
 		 * LAUNCH: the kernel descriptor a GPGPU driver receives
 		 * for every kernel launch (grid/block dims, the argument
 		 * buffer, the kernel to run).
+		 *
+		 * flags & VGPU_PKT_LAUNCH_ARGS_VA says the argument
+		 * buffer is named by a GPU VIRTUAL address in THIS
+		 * context (the shape a real launch has: the kernel gets
+		 * a device pointer) instead of by a GEM handle. Both
+		 * resolve to the same pages, but the VA case has to go
+		 * through the submitting fd's page tables.
 		 */
 		struct {
 			__u32 kid;	/* kernel id (VGPU_MODULE_LOAD) */
 			__u32 grid;	/* blocks in the grid */
 			__u32 block;	/* threads per block (<= 256) */
-			__u32 args_bo;	/* GEM handle of the argument buffer */
+			__u32 args_bo;	/* GEM handle, or a GPU VA (flags) */
 			__u32 args_off;	/* byte offset of the args inside it */
-			__u32 pad[3];
+			__u32 flags;	/* VGPU_PKT_LAUNCH_* */
+			__u32 pad[2];
 		} launch;
+		/*
+		 * Phase C: VA -> VA DMA. Both addresses are GPU virtual
+		 * addresses in the submitting fd's address space; the
+		 * driver walks that fd's page tables to find the pages.
+		 */
+		struct {
+			__u64 src_va;	/* page-aligned source VA */
+			__u64 dst_va;	/* page-aligned destination VA */
+			__u32 len;	/* bytes, page aligned, <= 256K */
+			__u32 pad[3];
+		} vm_copy;
 	};
 };
+
+/* VGPU_PKT_LAUNCH: args_bo carries a GPU virtual address. */
+#define VGPU_PKT_LAUNCH_ARGS_VA		BIT(0)
 
 /* VGPU_DOORBELL: "the writer has produced packets up to put". */
 struct vgpu_doorbell {
@@ -230,6 +301,13 @@ struct vgpu_query {
 #define DRM_VGPU_DOORBELL	0x08
 #define DRM_VGPU_MODULE_LOAD	0x09
 #define DRM_VGPU_MODULE_DESTROY	0x0a
+#define DRM_VGPU_VM_ALLOC	0x0b
+#define DRM_VGPU_VM_BIND	0x0c
+#define DRM_VGPU_VM_UNBIND	0x0d
+
+#define DRM_IOCTL_VGPU_VM_ALLOC		DRM_IOWR(VGPU_IOC(DRM_VGPU_VM_ALLOC), struct vgpu_vm_alloc)
+#define DRM_IOCTL_VGPU_VM_BIND		DRM_IOWR(VGPU_IOC(DRM_VGPU_VM_BIND), struct vgpu_vm_bind)
+#define DRM_IOCTL_VGPU_VM_UNBIND	DRM_IOWR(VGPU_IOC(DRM_VGPU_VM_UNBIND), struct vgpu_vm_unbind)
 
 #define DRM_IOCTL_VGPU_BO_CREATE	DRM_IOWR(VGPU_IOC(DRM_VGPU_BO_CREATE), struct vgpu_bo_create)
 #define DRM_IOCTL_VGPU_RING_GET		DRM_IOWR(VGPU_IOC(DRM_VGPU_RING_GET), struct vgpu_ring_get)
