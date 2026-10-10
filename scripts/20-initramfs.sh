@@ -41,6 +41,10 @@ echo "--- compute stats ---"
 cat /sys/kernel/debug/vgpu/compute
 echo "=== negative paths (bad handle / engine fault / ring full) ==="
 /root/vgpu_test -e || exit 1
+echo "=== phase C: GPU virtual memory (VMID isolation + VRAM budget) ==="
+/root/vgpu_test -v || exit 1
+echo "--- vm view: per-context VA ranges, budget, evictions ---"
+cat /sys/kernel/debug/vgpu/vm
 echo "=== ftrace: function_graph over vgpu_* ==="
 TR=/sys/kernel/debug/tracing
 echo function_graph > "$TR/current_tracer"

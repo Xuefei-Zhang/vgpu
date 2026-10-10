@@ -91,7 +91,6 @@ struct vgpu_submission {
 	struct vgpu_kernel *kernel;
 	struct drm_gem_object *args_obj;	/* the argument buffer (pinned) */
 	u32 args_off;
-	bool args_pinned;			/* we took the pin ourselves */
 	u32 grid, block;
 
 	/*
@@ -208,6 +207,7 @@ struct vgpu_vm_range {
 	struct list_head lru_node;	/* v->vram_lru, MRU at the tail */
 	u64 start;			/* VA, page aligned */
 	u64 size;			/* bytes */
+	struct vgpu_vm *vm;		/* owner: whose tables hold the PTEs */
 	struct drm_gem_object *obj;	/* our reference (a handle's is its own) */
 	u32 handle;			/* the fd handle it was bound with */
 	bool mapped;			/* resident: PTEs installed */
@@ -337,10 +337,11 @@ struct vgpu {
  */
 struct vgpu_vm *vgpu_vm_get(struct vgpu_file *vf);
 void vgpu_vm_destroy(struct vgpu_file *vf);
+/* This fd's VMID, or 0 if it has no address space yet. */
+u32 vgpu_vm_vmid(struct vgpu_file *vf);
 int vgpu_vm_alloc(struct vgpu_file *vf, u64 size, u64 align, u64 *va_out);
 int vgpu_vm_bind(struct vgpu_file *vf, u64 va, u32 handle, u32 flags);
 void vgpu_vm_unbind(struct vgpu_file *vf, u64 va);
-u64 vgpu_vm_alloc_range(struct vgpu_vm *vm, u64 size, u64 align);
 /*
  * Resolve npages of GPU VA in this fd. On success the caller owns the
  * returned object reference and one reference on each page — the same
@@ -352,8 +353,6 @@ int vgpu_vm_resolve(struct vgpu_file *vf, u64 va, u32 npages,
 void vgpu_vm_release(struct drm_gem_object *obj, struct page **pages,
 		     u32 npages);
 void vgpu_vm_release_sub(struct vgpu_submission *sub);
-int vgpu_vm_resolve_va(struct vgpu_file *vf, u64 va,
-		       struct drm_gem_object **objp, u32 *offp);
 void vgpu_vm_evict_all(struct vgpu *v);
 int vgpu_vm_show(struct seq_file *s, void *data);
 void vgpu_vm_destroy_all(struct vgpu *v);

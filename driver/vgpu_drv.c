@@ -1195,8 +1195,7 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 			    p->launch.block > 256 ||
 			    p->launch.block % 32 ||
 			    p->launch.grid < 1 ||
-			    p->launch.args_off % 4 ||
-			    p->launch.flags & ~VGPU_PKT_LAUNCH_ARGS_VA) {
+			    p->launch.args_off % 4) {
 				ret = -EINVAL;
 				goto err_unmap;
 			}
@@ -1249,35 +1248,13 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 		if (p->type == VGPU_PKT_LAUNCH) {
 			/*
 			 * The argument buffer: the kernel's global memory.
-			 * Two ways to name it — a GEM handle (phase D's
-			 * original shape) or a GPU virtual address in the
-			 * SUBMITTING fd's address space, which is what a
-			 * real launch actually passes: the kernel gets a
-			 * device pointer, and the driver has to walk the
-			 * submitter's page tables to find the buffer.
+			 * It is a pool buffer named by a GEM handle, pinned
+			 * for the submission's lifetime (see the BLIT note
+			 * below); the phase-C way to reach one by GPU VA is
+			 * VM_BIND + VGPU_PKT_VM_COPY, which walks the
+			 * submitter's page tables exactly as this resolve
+			 * does.
 			 */
-			if (p->launch.flags & VGPU_PKT_LAUNCH_ARGS_VA) {
-				struct drm_gem_object *obj = NULL;
-
-				ret = vgpu_vm_resolve_va(vf,
-						(u64)p->launch.args_bo
-						<< 32 | p->launch.args_off,
-						&obj, &sub->args_off);
-				if (!obj) {
-					ret = -ENOENT;
-					goto err_unmap;
-				}
-				/*
-				 * The mapping keeps the pages resident,
-				 * so all the submission needs is its own
-				 * reference — the same discipline the
-				 * handle case expresses with a pin.
-				 */
-				sub->args_obj = obj;
-				sub->args_pinned = false;
-				continue;
-			}
-
 			sub->args_obj = drm_gem_object_lookup(file,
 							      p->launch.args_bo);
 			if (!sub->args_obj) {
@@ -1387,9 +1364,9 @@ err_free_sub:
 err_unmap:
 	kunmap_local(pk);
 	if (sub->args_obj) {
-		if (sub->args_pinned)
-			drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
+		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
 		drm_gem_object_put(sub->args_obj);
+		sub->args_obj = NULL;
 	}
 	vgpu_vm_release_sub(sub);
 	kfree(sub);
@@ -1409,21 +1386,23 @@ static int vgpu_vm_alloc_ioctl(struct drm_device *dev, void *data,
 	struct vgpu_vm_alloc *arg = data;
 	struct vgpu_file *vf = file->driver_priv;
 	struct vgpu *v = to_vgpu(dev);
-	struct vgpu_vm *vm;
 	int ret;
 
-	if (!vf || arg->size < PAGE_SIZE)
+	/*
+	 * align is a reservation alignment, so the same rules a CPU mmap
+	 * has: 0 means "anywhere", otherwise a power of two >= PAGE_SIZE.
+	 * Rejected here (and not silently fixed up) so a caller that
+	 * asks for a bogus alignment hears about it.
+	 */
+	if (!vf || arg->size < PAGE_SIZE ||
+	    arg->align & (arg->align - 1))
 		return -EINVAL;
-
-	vm = vgpu_vm_get(vf);
-	if (IS_ERR(vm))
-		return PTR_ERR(vm);
 
 	ret = vgpu_vm_alloc(vf, arg->size, arg->align, &arg->va);
 	if (ret)
 		return ret;
 
-	arg->vmid = vm->vmid;
+	arg->vmid = vgpu_vm_vmid(vf);
 	dev_info(&v->pdev->dev,
 		 "[vgpu:vm] vmid %u: reserved va 0x%llx (%llu B)\n",
 		 arg->vmid, (unsigned long long)arg->va,

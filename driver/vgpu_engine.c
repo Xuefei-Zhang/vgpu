@@ -381,12 +381,7 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 
 	/* release the launch's argument buffer (unpin + object ref) */
 	if (sub->args_obj) {
-		/*
-		 * Phase C: a VA-named argument buffer is pinned by its VM
-		 * mapping, not by us — we only borrowed a reference.
-		 */
-		if (sub->args_pinned)
-			drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
+		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
 		drm_gem_object_put(sub->args_obj);
 		sub->args_obj = NULL;
 	}

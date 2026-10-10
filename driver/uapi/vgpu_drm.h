@@ -217,23 +217,19 @@ struct vgpu_packet {
 		/*
 		 * LAUNCH: the kernel descriptor a GPGPU driver receives
 		 * for every kernel launch (grid/block dims, the argument
-		 * buffer, the kernel to run).
-		 *
-		 * flags & VGPU_PKT_LAUNCH_ARGS_VA says the argument
-		 * buffer is named by a GPU VIRTUAL address in THIS
-		 * context (the shape a real launch has: the kernel gets
-		 * a device pointer) instead of by a GEM handle. Both
-		 * resolve to the same pages, but the VA case has to go
-		 * through the submitting fd's page tables.
+		 * buffer, the kernel to run). The argument buffer is
+		 * named by a GEM handle: it is a pool buffer, and the
+		 * phase-C way to address one by GPU VA is VM_BIND +
+		 * VGPU_PKT_VM_COPY, which is the path that has to go
+		 * through the submitter's page tables.
 		 */
 		struct {
 			__u32 kid;	/* kernel id (VGPU_MODULE_LOAD) */
 			__u32 grid;	/* blocks in the grid */
 			__u32 block;	/* threads per block (<= 256) */
-			__u32 args_bo;	/* GEM handle, or a GPU VA (flags) */
+			__u32 args_bo;	/* GEM handle of the argument buffer */
 			__u32 args_off;	/* byte offset of the args inside it */
-			__u32 flags;	/* VGPU_PKT_LAUNCH_* */
-			__u32 pad[2];
+			__u32 pad[3];
 		} launch;
 		/*
 		 * Phase C: VA -> VA DMA. Both addresses are GPU virtual
@@ -248,9 +244,6 @@ struct vgpu_packet {
 		} vm_copy;
 	};
 };
-
-/* VGPU_PKT_LAUNCH: args_bo carries a GPU virtual address. */
-#define VGPU_PKT_LAUNCH_ARGS_VA		BIT(0)
 
 /* VGPU_DOORBELL: "the writer has produced packets up to put". */
 struct vgpu_doorbell {

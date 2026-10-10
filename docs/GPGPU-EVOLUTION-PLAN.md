@@ -259,12 +259,17 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | A | 多引擎多队列（stream 语义） | ✅ 已完成并 guest 验证 | `1657cdc` |
 | B | 门铃 + 引擎侧取指（packet 提交） | ✅ 已完成并 guest 验证 | `8ebd16f` |
 | D | 计算语义：kernel launch / warp 执行 / 合并率 | ✅ 已完成并 guest 验证 | `f6b9b0c` |
-| C, E–J | 见上表 | ⬜ 待开发 | — |
+| C | GPU 虚拟内存：VMID / VA / 页表 / VRAM 预算驱逐 | ✅ 已完成并 guest 验证 | 见 `phase/c-vm` 分支 |
+| E–J | 见上表 | ⬜ 待开发 | — |
 
 **已交付内容**：per-fd 多队列（每队列独立 ring + fence timeline + doorbell）、三个引擎（gfx/copy/compute）各自
 ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、7 指令教学 ISA +
 warp 同步执行器 + LAUNCH packet + MODULE_LOAD 模块注册 + broadcast/coalesced/strided 三类访存统计、
 debugfs `queues`/`compute` 视图、`-q`/`-p`/saxpy 测试与 autorun 集成。
+**Phase C 新增**：per-fd GPU 地址空间（每 fd 一个 VMID + 自己的两级软件页表，driver 做这个 walk——模拟
+真实硬件里 GCMC/SMMU 的 walk）、`VM_ALLOC`/`VM_BIND`/`VM_UNBIND` ioctl、`VGPU_PKT_VM_COPY`（VA→VA DMA，
+提交时通过提交者的页表解析，引擎只看到页）、设备级 VRAM budget + LRU 驱逐 + 按需重映射（transparent
+re-map）、debugfs `vm` 视图（每 context 的 VA 区间状态 + budget/evicted/fault 计数器，可写 budget）。
 **实例**：`userspace/examples/saxpy.c`——CUDA SAXPY 的 vgpu 对应实现，4096 元素全对；
 入门/测试/trace/实例教学见 `docs/GETTING-STARTED.md`。
 
@@ -273,6 +278,14 @@ debugfs `queues`/`compute` 视图、`-q`/`-p`/saxpy 测试与 autorun 集成。
 2. `container_of` 数组元素陷阱：减了数组基址偏移导致 engine 1/2 的设备指针错位
 3. 设备级 scratch 水位按**完成序**回收——多引擎并发才暴露的分配/回收乱序
 4. **三种尺寸混淆**：ring 槽 64B / command 结构 48B / packet 40B，混用导致 scratch 水位下溢 48B/批
+
+**Phase C 过程中抓到并修复的 3 个真 bug**：
+5. `list_add_tail(new, &prev->node)` 用错：该宏第二个参数是**链表头**，于是新区间被插到 `prev` **之前**，
+   保留区间不再按地址有序 → 分配器把同一个 VA 发第二次，两个 buffer 共享一组 PTE（隔离直接失效）
+6. seq_file show 回调的 `data` 参数是 `SEQ_START_TOKEN`（`(void*)1`）而不是私有指针——从 `data` 取设备指针
+   等于解引用 1，KASAN 当场 panic；驱动其余 show 函数都用 `s->private`
+7. VM_BIND 引用计数：`drm_gem_object_lookup` 的引用 + `drm_gem_object_get` 共拿了两个引用，unbind 只还一个，
+   每个 bind 泄漏一个对象引用
 
 **下一步建议**：C（VMID/VA/页表+显存管理）与 A/B/D 无依赖，`~/self/wt/c` 工作树已就绪；
 E（UVM 迁移）依赖 C+D；F（抢占）依赖 D；G（同步/图）依赖 B；H（fault containment）依赖 C+D。

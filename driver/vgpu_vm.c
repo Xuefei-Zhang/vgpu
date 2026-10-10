@@ -117,18 +117,30 @@ static void vgpu_vm_unmap_range(struct vgpu_vm *vm, u64 start, u64 size)
  * Map a range into this VM's tables and make it the most recently used
  * entry: the LRU tail is MRU, so whoever calls this last has the best
  * claim to stay resident.
+ *
+ * @obj is the object to map (== r->obj for the bind/demand paths), and
+ * it is passed in rather than read from the range so the caller can map
+ * BEFORE it publishes r->obj: an install that fails part-way through
+ * must leave the range unbound, not bound-with-half-a-page-table.
+ * That is why the failure path unwinds the whole range — a half
+ * installed table would leave valid PTEs behind that no accounting
+ * knows about, and the next unbind of this range would leave them
+ * pointing at a freed BO.
  */
-static void vgpu_vm_map_range(struct vgpu *v, struct vgpu_vm *vm,
-			      struct vgpu_vm_range *r)
+static int vgpu_vm_map_range(struct vgpu *v, struct vgpu_vm *vm,
+			     struct vgpu_vm_range *r, struct drm_gem_object *obj)
 {
-	struct drm_gem_shmem_object *sh = to_drm_gem_shmem_obj(r->obj);
+	struct drm_gem_shmem_object *sh = to_drm_gem_shmem_obj(obj);
 
-	if (vgpu_vm_map_pages(vm, r->start, r->size >> PAGE_SHIFT, sh->pages))
-		return;
+	if (vgpu_vm_map_pages(vm, r->start, r->size >> PAGE_SHIFT, sh->pages)) {
+		vgpu_vm_unmap_range(vm, r->start, r->size);
+		return -ENOMEM;
+	}
 	r->mapped = true;
 	list_add_tail(&r->lru_node, &v->vram_lru);
 	vm->resident += r->size;
 	v->vram_resident += r->size;
+	return 0;
 }
 
 /*
@@ -150,9 +162,18 @@ static void vgpu_vm_evict_to_budget(struct vgpu *v, struct vgpu_vm_range *keep)
 			break;
 		if (r == keep)
 			continue;
-		vgpu_vm_unmap_range(r->start, r->size);
+		/*
+		 * r->vm is the mapping's owner — the PTEs we unwind live
+		 * in that context's level-1 page, NOT in the evicting
+		 * one's (a range can be found by walking any VM's list
+		 * only through its own vm pointer, and container_of on a
+		 * shared list would give the wrong VM).
+		 */
+		vgpu_vm_unmap_range(r->vm, r->start, r->size);
+		r->vm->resident -= r->size;
 		r->mapped = false;
 		list_del_init(&r->lru_node);
+		v->vram_resident -= r->size;
 		v->stats_evicted++;
 		pr_debug("[vgpu:vm] evicted va 0x%llx (%llu B) to host "
 			 "(resident %llu / %llu)\n",
@@ -194,6 +215,11 @@ void vgpu_vm_destroy_all(struct vgpu *v)
  * runs drm_mm (colour tracking, splitting, alignment); ours is a list,
  * which is the honest size of the problem here and keeps "two contexts
  * asked for the same address" readable.
+ */
+/*
+ * File-local: the only caller is the reserve path below, and keeping it
+ * static means the header does not grow a one-user API (the same reason
+ * vgpu_vm_pte_page and vgpu_vm_map_range stay local).
  */
 static u64 vgpu_vm_alloc_range(struct vgpu_vm *vm, u64 size, u64 align)
 {
@@ -254,18 +280,28 @@ static int vgpu_vm_reserve(struct vgpu_vm *vm, u64 size, u64 align,
 	INIT_LIST_HEAD(&r->lru_node);
 	r->start = va;
 	r->size = ALIGN(size, PAGE_SIZE);
+	r->vm = vm;
 
-	/* keep the list in address order: the allocator relies on it */
+	/* the range that precedes @va, or NULL if it belongs at the head */
 	prev = NULL;
 	list_for_each_entry(iter, &vm->ranges, node) {
 		if (iter->start > va)
 			break;
 		prev = iter;
 	}
-	if (prev)
-		list_add_tail(&r->node, &prev->node);
-	else
-		list_add(&r->node, &vm->ranges);
+
+	/*
+	 * Insert the new range right after @prev, keeping the list in
+	 * address order — the first-fit search above relies on it.
+	 *
+	 * list_add(), not list_add_tail(): list_add_tail() takes a LIST
+	 * HEAD, so list_add_tail(new, &prev->node) splices the new entry
+	 * in immediately BEFORE prev. With that, the list stopped being
+	 * sorted, the allocator then handed the same VA out twice, and two
+	 * buffers ended up described by one set of PTEs — a reservation
+	 * overlapping its neighbour is the one thing a VM must never do.
+	 */
+	list_add(&r->node, prev ? &prev->node : &vm->ranges);
 
 	vm->nranges++;
 	*va_out = va;
@@ -286,6 +322,16 @@ int vgpu_vm_alloc(struct vgpu_file *vf, u64 size, u64 align, u64 *va_out)
 	ret = vgpu_vm_reserve(vm, size, align, va_out);
 	mutex_unlock(&v->vm_lock);
 	return ret;
+}
+
+u32 vgpu_vm_vmid(struct vgpu_file *vf)
+{
+	u32 vmid;
+
+	mutex_lock(&vf->vf_dev->vm_lock);
+	vmid = vf->vm ? vf->vm->vmid : 0;
+	mutex_unlock(&vf->vf_dev->vm_lock);
+	return vmid;
 }
 
 /* -------------------------------------------------------- VM lifecycle */
@@ -368,7 +414,7 @@ static void vgpu_vm_free(struct vgpu *v, struct vgpu_vm *vm)
 	list_for_each_entry_safe(r, tmp, &vm->ranges, node) {
 		if (r->obj) {
 			if (r->mapped) {
-				vgpu_vm_unmap_range(r->start, r->size);
+				vgpu_vm_unmap_range(vm, r->start, r->size);
 				list_del_init(&r->lru_node);
 				vm->resident -= r->size;
 				v->vram_resident -= r->size;
@@ -418,12 +464,37 @@ void vgpu_vm_destroy(struct vgpu_file *vf)
 
 /* ------------------------------------------------------------ bind/unbind */
 
+/*
+ * The queue rings are the driver's own objects. They are handed out as
+ * GEM handles so the fd can mmap them (an fd may only mmap a fake offset
+ * for which it holds a handle), but they are not pool memory the device
+ * may address: binding one would let a VA copy scribble on a live
+ * command ring. A real driver makes the same distinction (its own
+ * private objects never enter the user's address space).
+ */
+static bool vgpu_vm_bind_private(struct vgpu_file *vf, struct drm_gem_object *obj)
+{
+	struct vgpu_queue *q;
+	unsigned long flags;
+	bool found = false;
+
+	spin_lock_irqsave(&vf->vf_dev->lock, flags);
+	list_for_each_entry(q, &vf->queues, node) {
+		if (&q->ring_bo->base == obj) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&vf->vf_dev->lock, flags);
+	return found;
+}
+
 int vgpu_vm_bind(struct vgpu_file *vf, u64 va, u32 handle, u32 flags)
 {
 	struct vgpu *v = vf->vf_dev;
 	struct drm_gem_shmem_object *sh;
 	struct vgpu_vm_range *r;
-	struct vgpu_vm *vm;
+	u32 vmid;
 	int ret;
 
 	if (va & ~PAGE_MASK)
@@ -436,46 +507,53 @@ int vgpu_vm_bind(struct vgpu_file *vf, u64 va, u32 handle, u32 flags)
 	 * (GFP_KERNEL, and the WC path runs set_pages_array ->
 	 * smp_call_function). The lock is taken only once we hold
 	 * everything we may need.
+	 *
+	 * The lookup's reference becomes the range's own — the handle
+	 * table keeps its own, so there is nothing extra to take (and
+	 * unbind gives it back with exactly one put).
 	 */
-	sh = NULL;
-	{
-		struct drm_gem_object *obj;
-
-		obj = drm_gem_object_lookup(vf->drm_file, handle);
-		if (!obj)
-			return -ENOENT;
-		if (drm_gem_shmem_pin(to_drm_gem_shmem_obj(obj))) {
-			drm_gem_object_put(obj);
-			return -ENOMEM;
-		}
-		/* the VM's own reference, dropped at unbind */
-		drm_gem_object_get(obj);
-		sh = to_drm_gem_shmem_obj(obj);
+	sh = to_drm_gem_shmem_obj(drm_gem_object_lookup(vf->drm_file, handle));
+	if (!sh)
+		return -ENOENT;
+	if (vgpu_vm_bind_private(vf, &sh->base)) {
+		drm_gem_object_put(&sh->base);
+		return -EINVAL;
+	}
+	if (drm_gem_shmem_pin(sh)) {
+		drm_gem_object_put(&sh->base);
+		return -ENOMEM;
 	}
 
 	mutex_lock(&v->vm_lock);
-	vm = vf->vm;
-	if (!vm) {
+	if (!vf->vm) {
 		ret = -ENOENT;
 		goto out_unlock;
 	}
-	r = vgpu_vm_range_find(vm, va);
+	r = vgpu_vm_range_find(vf->vm, va);
 	if (!r || r->start != va || r->obj || sh->base.size < r->size) {
 		ret = -EINVAL;
 		goto out_unlock;
 	}
 
+	/*
+	 * Map first, while the range is still unbound: if the table
+	 * install fails the caller gets -ENOMEM with the range (and its
+	 * reservation) untouched.
+	 */
+	ret = vgpu_vm_map_range(v, vf->vm, r, &sh->base);
+	if (ret)
+		goto out_unlock;
+
 	r->obj = &sh->base;
 	r->handle = handle;
 	v->stats_bound++;
-
-	vgpu_vm_map_range(v, vm, r);
 	vgpu_vm_evict_to_budget(v, r);
+	vmid = vf->vm->vmid;
 	mutex_unlock(&v->vm_lock);
 
 	dev_info(&v->pdev->dev,
 		 "[vgpu:vm] vmid %u: bound va 0x%llx + %llu B <- bo#%u (%s)\n",
-		 vm->vmid, r->start, r->size, handle,
+		 vmid, r->start, r->size, handle,
 		 r->mapped ? "resident" : "evicted, over VRAM budget");
 	return 0;
 
@@ -491,30 +569,28 @@ void vgpu_vm_unbind(struct vgpu_file *vf, u64 va)
 	struct vgpu *v = vf->vf_dev;
 	struct drm_gem_shmem_object *sh;
 	struct vgpu_vm_range *r;
-	struct vgpu_vm *vm;
 	u32 vmid;
 
 	if (va & ~PAGE_MASK)
 		return;
 
 	mutex_lock(&v->vm_lock);
-	vm = vf->vm;
-	r = vm ? vgpu_vm_range_find(vm, va) : NULL;
+	r = vf->vm ? vgpu_vm_range_find(vf->vm, va) : NULL;
 	if (!r || !r->obj) {
 		mutex_unlock(&v->vm_lock);
 		return;
 	}
 	if (r->mapped) {
-		vgpu_vm_unmap_range(r->start, r->size);
+		vgpu_vm_unmap_range(vf->vm, r->start, r->size);
 		list_del_init(&r->lru_node);
-		vm->resident -= r->size;
+		vf->vm->resident -= r->size;
 		v->vram_resident -= r->size;
 		r->mapped = false;
 	}
 	sh = to_drm_gem_shmem_obj(r->obj);
 	r->obj = NULL;
 	r->handle = 0;
-	vmid = vm->vmid;
+	vmid = vf->vm->vmid;
 	mutex_unlock(&v->vm_lock);
 
 	/* unpin/put may free pages: outside vm_lock */
@@ -552,13 +628,11 @@ int vgpu_vm_resolve(struct vgpu_file *vf, u64 va, u32 npages,
 {
 	struct vgpu *v = vf->vf_dev;
 	struct vgpu_vm_range *r;
-	struct vgpu_vm *vm;
 	u32 i;
 	int ret = 0;
 
 	mutex_lock(&v->vm_lock);
-	vm = vf->vm;
-	r = vm ? vgpu_vm_range_find(vm, va) : NULL;
+	r = vf->vm ? vgpu_vm_range_find(vf->vm, va) : NULL;
 	if (!r || !r->obj ||
 	    va + (u64)npages * PAGE_SIZE > r->start + r->size) {
 		mutex_unlock(&v->vm_lock);
@@ -566,18 +640,28 @@ int vgpu_vm_resolve(struct vgpu_file *vf, u64 va, u32 npages,
 	}
 
 	if (!r->mapped) {
-		vgpu_vm_map_range(v, vm, r);
+		/*
+		 * The device faulted on a VA it had bound: service it.
+		 * The BO never moved (its pages are host memory, which
+		 * is where "evicted to host" lands), so a service is a
+		 * PTE install and nothing else.
+		 */
+		ret = vgpu_vm_map_range(v, vf->vm, r, r->obj);
+		if (ret) {
+			mutex_unlock(&v->vm_lock);
+			return ret;
+		}
 		v->stats_vm_faults++;
 		v->stats_remap_pages += r->size >> PAGE_SHIFT;
 		dev_info(&v->pdev->dev,
 			 "[vgpu:vm] vmid %u: fault va 0x%llx -> demand mapped "
 			 "%llu B back into VRAM\n",
-			 vm->vmid, va, r->size);
+			 vf->vm->vmid, va, r->size);
 	}
 
 	for (i = 0; i < npages; i++) {
 		u64 a = va + (u64)i * PAGE_SIZE;
-		u32 *ptes = vgpu_vm_pte_page(vm, a, false);
+		u32 *ptes = vgpu_vm_pte_page(vf->vm, a, false);
 		u32 pte;
 
 		if (IS_ERR_OR_NULL(ptes)) {
@@ -650,40 +734,6 @@ void vgpu_vm_release_sub(struct vgpu_submission *sub)
 	sub->vm_dst_pages = NULL;
 }
 
-/*
- * Resolve a single GPU address — the helper a KERNEL LAUNCH needs,
- * because a launch hands the driver one device pointer, not a range.
- * On success the caller owns an object reference and the byte offset
- * inside the buffer it was bound to (which is what a kernel's argument
- * pointer means: an offset into "global memory").
- */
-int vgpu_vm_resolve_va(struct vgpu_file *vf, u64 va,
-		       struct drm_gem_object **objp, u32 *offp)
-{
-	struct vgpu *v = vf->vf_dev;
-	struct vgpu_vm_range *r;
-	struct page *page;
-	u64 base;
-	int ret;
-
-	mutex_lock(&v->vm_lock);
-	r = vf->vm ? vgpu_vm_range_find(vf->vm, va) : NULL;
-	if (!r || !r->obj) {
-		mutex_unlock(&v->vm_lock);
-		return -ENOENT;
-	}
-	base = r->start;
-	mutex_unlock(&v->vm_lock);
-
-	ret = vgpu_vm_resolve(vf, va & PAGE_MASK, 1, objp, &page);
-	if (ret)
-		return ret;
-	put_page(page);		/* the object reference is enough here */
-
-	*offp = (u32)(base + (va & ~PAGE_MASK));
-	return 0;
-}
-
 /* ------------------------------------------------------------ debugfs */
 
 /*
@@ -692,12 +742,26 @@ int vgpu_vm_resolve_va(struct vgpu_file *vf, u64 va,
  * Also writable: shrinking the budget at runtime applies it
  * immediately, which is how the guest test drives eviction without
  * needing a module parameter.
+ *
+ * The layout is deliberately greppable — the per-range state word is
+ * one of reserved/mapped/evicted, and the device line carries the two
+ * counters the acceptance criteria name.
  */
 int vgpu_vm_show(struct seq_file *s, void *data)
 {
-	struct vgpu *v = data;
+	/*
+	 * The pointer is in seq_file::private, NOT in the show callback's
+	 * @data: single_open()'s start() hands show() SEQ_START_TOKEN
+	 * ((void*)1) as the iterator cookie, so @data is a dummy. Reading
+	 * the device from @data dereferences 1 and takes the box down (it
+	 * did — this is why every other show function in this driver uses
+	 * s->private).
+	 */
+	struct vgpu *v = s->private;
 	struct vgpu_vm *vm;
 	u32 nvm = 0;
+
+	(void)data;
 
 	mutex_lock(&v->vm_lock);
 	list_for_each_entry(vm, &v->vm_list, node) {
@@ -715,11 +779,10 @@ int vgpu_vm_show(struct seq_file *s, void *data)
 		nvm++;
 	}
 	seq_printf(s, "contexts %u  bound %llu range(s)\n", nvm, v->stats_bound);
-	seq_printf(s, "budget %llu B  resident %llu B\n",
-		   v->vram_budget, v->vram_resident);
-	seq_printf(s, "evicted %llu  faults %llu  remapped %llu pages\n",
-		   v->stats_evicted, v->stats_vm_faults,
-		   v->stats_remap_pages);
+	seq_printf(s, "device: budget %llu B  resident %llu B  "
+		   "evicted %llu  demand-faults %llu  remapped %llu pages\n",
+		   v->vram_budget, v->vram_resident, v->stats_evicted,
+		   v->stats_vm_faults, v->stats_remap_pages);
 	mutex_unlock(&v->vm_lock);
 	return 0;
 }
