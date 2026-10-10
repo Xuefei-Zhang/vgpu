@@ -8,17 +8,20 @@ BUSYBOX=/usr/bin/busybox
 
 [ -f "$ROOT/driver/vgpu.ko" ] || { echo "run scripts/10-build.sh first"; exit 1; }
 [ -f "$ROOT/userspace/vgpu_test" ] || { echo "run scripts/10-build.sh first"; exit 1; }
+[ -f "$ROOT/userspace/examples/vgpu_smi" ] || { echo "run scripts/10-build.sh first"; exit 1; }
 
 rm -rf "$INITDIR"
 mkdir -p "$INITDIR"/{bin,proc,sys,dev,root,etc}
 cp "$BUSYBOX" "$INITDIR/bin/busybox"
 for c in sh insmod rmmod ls cat echo mount sleep printf true false \
-         lsmod dmesg grep hexdump dd test rm mkdir cp mv mknod; do
+         lsmod dmesg grep hexdump dd test rm mkdir cp mv mknod \
+         sed awk wc seq; do
 	ln -sf busybox "$INITDIR/bin/$c"
 done
 cp "$ROOT/driver/vgpu.ko" "$INITDIR/root/"
 cp "$ROOT/userspace/vgpu_test" "$INITDIR/root/"
 [ -f "$ROOT/userspace/examples/saxpy" ] && cp "$ROOT/userspace/examples/saxpy" "$INITDIR/root/"
+cp "$ROOT/userspace/examples/vgpu_smi" "$INITDIR/root/"
 # autorun marker (if present next to the scripts) triggers the test on boot
 [ -f "$ROOT/autorun" ] && touch "$INITDIR/root/autorun"
 
@@ -39,6 +42,72 @@ echo "=== compute: saxpy kernel launch (the CUDA example) ==="
 /root/saxpy || exit 1
 echo "--- compute stats ---"
 cat /sys/kernel/debug/vgpu/compute
+echo "=== vgpu-smi-lite: device observability (phase J) ==="
+mkdir -p /tmp
+DBG=/sys/kernel/debug/vgpu
+/root/vgpu_smi > /tmp/smi.txt || exit 1
+cat /tmp/smi.txt
+# Cross-validation: an observability tool is only worth its numbers,
+# so every number the tool printed is compared here against the very
+# debugfs file it came from (the tool also echoes its raw counters at
+# the bottom of the report - these lines diff them mechanically).
+xcheck_all() { # $1 = "queues" to also compare the queue table
+	xf=0
+	xck() {
+		if [ "$2" = "$3" ]; then
+			echo "OK   xcheck $1: tool=$2 debugfs=$3"
+		else
+			echo "FAIL xcheck $1: tool=$2 debugfs=$3"
+			xf=1
+		fi
+	}
+	tv() { line=$(grep -F "$1=" "$SMI"); echo "${line#*=}"; }
+	xck submitted "$(tv 'raw stats submitted')" "$(awk '$1=="submitted"{print $2}' $DBG/stats)"
+	xck completed "$(tv 'raw stats completed')" "$(awk '$1=="completed"{print $2}' $DBG/stats)"
+	xck errors "$(tv 'raw stats errors')" "$(awk '$1=="errors"{print $2}' $DBG/stats)"
+	for e in gfx copy compute; do
+		xck "scratch[$e]" "$(tv "raw stats scratch[$e]")" "$(grep -F "scratch[$e]" $DBG/stats | awk '{print $2"/"$4}')"
+		# the driver pads engine names: awk sees "engine[gfx" then "]"
+		xck "backlog[$e]" "$(tv "raw stats engine[$e].backlog")" "$(grep -F "engine[$e" $DBG/stats | awk '{print $NF}')"
+	done
+	xck compute.kernels "$(tv 'raw compute kernels')" "$(awk '$1=="kernels"{print $2}' $DBG/compute)"
+	xck compute.blocks "$(tv 'raw compute blocks')" "$(awk '$1=="blocks"{print $2}' $DBG/compute)"
+	xck compute.warps "$(tv 'raw compute warps')" "$(awk '$1=="warps"{print $2}' $DBG/compute)"
+	xck compute.threads "$(tv 'raw compute threads')" "$(awk '$1=="threads"{print $2}' $DBG/compute)"
+	xck compute.waves "$(tv 'raw compute waves')" "$(awk '$1=="waves"{print $2}' $DBG/compute)"
+	xck compute.instrs "$(tv 'raw compute instrs')" "$(awk '$1=="instrs"{print $2}' $DBG/compute)"
+	xck compute.mem_ops "$(tv 'raw compute mem_ops')" "$(awk '$1=="mem_ops"{print $2}' $DBG/compute)"
+	xck compute.broadcast_warps "$(tv 'raw compute warps_broadcast')" "$(awk '$1=="broadcast"{print $3}' $DBG/compute)"
+	xck compute.coalesced_warps "$(tv 'raw compute warps_coalesced')" "$(awk '$1=="coalesced"{print $3}' $DBG/compute)"
+	xck compute.strided_warps "$(tv 'raw compute warps_strided')" "$(awk '$1=="strided"{print $3}' $DBG/compute)"
+	xck compute.latency_ns "$(tv 'raw compute modelled_mem_latency_ns')" "$(awk '$1=="modelled"{print $4}' $DBG/compute)"
+	xck pending.count "$(tv 'raw pending count')" "$(grep -c 'seq#' $DBG/pending)"
+	xck regs.status "$(tv 'raw regs status')" "$(awk '$1=="status"{print $3}' $DBG/regs)"
+	xck regs.seqno "$(tv 'raw regs seqno')" "$(awk '$1=="seqno"{print $3}' $DBG/regs)"
+	xck regs.error "$(tv 'raw regs error')" "$(awk '$1=="error"{print $3}' $DBG/regs)"
+	xck regs.user "$(tv 'raw regs user')" "$(awk '$1=="user"{print $3}' $DBG/regs)"
+	if [ "$1" = "queues" ]; then
+		xck queues.count "$(tv 'raw queues count')" "$(grep -c '^q#' $DBG/queues)"
+	fi
+	if [ "$xf" = 0 ]; then
+		echo "cross-validation: OK - every tool number matches the debugfs file it came from"
+	else
+		echo "cross-validation: FAILED"
+		exit 1
+	fi
+}
+SMI=/tmp/smi.txt
+xcheck_all queues
+echo "--- live streams: three queues held open while vgpu_smi observes ---"
+/root/vgpu_smi --demo > /tmp/smi_demo.txt || exit 1
+cat /tmp/smi_demo.txt
+# (the demo's streams close when it exits, so its queue table is the
+# only thing that cannot be re-checked against the files afterwards)
+SMI=/tmp/smi_demo.txt
+xcheck_all
+echo "--- the debugfs files right after the demo closed its streams ---"
+cat $DBG/stats
+cat $DBG/queues
 echo "=== negative paths (bad handle / engine fault / ring full) ==="
 /root/vgpu_test -e || exit 1
 echo "=== ftrace: function_graph over vgpu_* ==="
