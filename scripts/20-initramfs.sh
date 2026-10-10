@@ -41,7 +41,11 @@ echo "--- compute stats ---"
 cat /sys/kernel/debug/vgpu/compute
 echo "=== negative paths (bad handle / engine fault / ring full) ==="
 /root/vgpu_test -e || exit 1
-echo "=== ftrace: function_graph over vgpu_* ==="
+echo "=== phase F: timeslicing + preemption ==="
+/root/vgpu_test -f || exit 1
+echo "--- scheduler view (debugfs compute) ---"
+cat /sys/kernel/debug/vgpu/compute
+echo "--- ftrace: function_graph over vgpu_* ==="
 TR=/sys/kernel/debug/tracing
 echo function_graph > "$TR/current_tracer"
 echo 'vgpu_*' > "$TR/set_ftrace_filter"

@@ -19,6 +19,9 @@
  *        (streams + per-engine command classes).
  * -e:   the negative paths only (rejected doorbell, engine faults,
  * ring full) — each must fail the exact way DESIGN.md §10 says.
+ * -f:   phase F: timeslicing (two contexts on the compute engine must
+ *        interleave) and preemption (a prio=2 launch submitted while a
+ *        prio=0 one runs must pause it), with both results correct.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -687,6 +690,313 @@ out:
 	return rc;
 }
 
+/*
+ * Phase F: preemption and timeslicing.
+ *
+ * Two hires:
+ *  (a) two contexts of the SAME priority each launch a long kernel on
+ *      the compute engine. One engine, one pipe: they can only both
+ *      finish if the scheduler round-robins between them at safe
+ *      points, which is the timeslice. The debugfs "compute" file (the
+ *      driver's own accounting) must show context switches.
+ *  (b) a high-priority launch submitted while a low-priority one is
+ *      running must pause it mid-grid and run first — cooperative
+ *      preemption, since a GPU has no "stop" wire — and BOTH must
+ *      produce correct results afterwards (a preemption that loses the
+ *      interrupted launch's state would corrupt its output).
+ *
+ * The long kernels are saxpy with a large grid: the modelled per-block
+ * SM work makes each launch take milliseconds of real time, so the
+ * timing is deterministic without any sleep.
+ */
+#define F_BLOCK		64
+#define F_GRID		256
+#define F_N_ELEMS	(F_GRID * F_BLOCK)	/* one element per thread */
+#define F_PARAM_WORDS	8
+
+/* one scheduler counter out of debugfs (device-global, cumulative) */
+static unsigned long long f_stat(const char *key)
+{
+	static char buf[4096];
+	char *p;
+	int fd;
+	ssize_t n, total = 0;
+
+	fd = open("/sys/kernel/debug/vgpu/compute", O_RDONLY);
+	if (fd < 0)
+		return 0;
+	while (total < (ssize_t)sizeof(buf) - 1 &&
+	       (n = read(fd, buf + total, sizeof(buf) - 1 - total)) > 0)
+		total += n;
+	close(fd);
+	if (total <= 0)
+		return 0;
+	buf[total] = '\0';
+
+	p = strstr(buf, key);
+	return p ? strtoull(p + strlen(key), NULL, 10) : 0;
+}
+
+struct f_ctx {
+	uint32_t *args;
+	uint8_t *ring;
+	uint32_t bo_handle;
+	uint32_t qid;
+	uint32_t a, b;
+};
+
+/* one context: its own "VRAM" (args BO) and its own compute queue */
+static int f_ctx_create(int fd, uint32_t prio, struct f_ctx *c,
+			uint32_t a, uint32_t b)
+{
+	struct vgpu_bo_create bo;
+	struct vgpu_queue_create qc;
+	int i;
+
+	memset(&bo, 0, sizeof(bo));
+	bo.size = (F_PARAM_WORDS + 2 * F_N_ELEMS) * 4;
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create"))
+		return -1;
+	c->bo_handle = bo.handle;
+	c->args = xmap(fd, bo.mmap_offset, bo.size);
+
+	c->args[0] = F_N_ELEMS;
+	c->args[1] = a;
+	c->args[2] = b;
+	c->args[3] = F_PARAM_WORDS;			/* in[] word index */
+	c->args[4] = F_PARAM_WORDS + F_N_ELEMS;		/* out[] word index */
+	for (i = 0; i < F_N_ELEMS; i++) {
+		c->args[F_PARAM_WORDS + i] = i * 2 + 1;
+		c->args[F_PARAM_WORDS + F_N_ELEMS + i] = 0xdeadbeef;
+	}
+
+	memset(&qc, 0, sizeof(qc));
+	qc.engine = VGPU_ENGINE_COMPUTE;
+	qc.prio = prio;
+	qc.nslots = 16;
+	if (check(fd, &qc, DRM_IOCTL_VGPU_QUEUE_CREATE, "queue_create"))
+		return -1;
+	c->qid = qc.qid;
+	c->ring = xmap(fd, qc.mmap_offset, qc.ring_size);
+	c->a = a;
+	c->b = b;
+	return 0;
+}
+
+/* "cudaLaunchKernel" on one context's queue */
+static int f_launch(int fd, uint32_t kid, struct f_ctx *c, uint32_t *seqno)
+{
+	struct vgpu_packet *pk = (struct vgpu_packet *)c->ring;
+	struct vgpu_doorbell db;
+
+	memset(pk, 0, sizeof(*pk));
+	pk[0].type = VGPU_PKT_LAUNCH;
+	pk[0].launch.kid = kid;
+	pk[0].launch.grid = F_GRID;
+	pk[0].launch.block = F_BLOCK;
+	pk[0].launch.args_bo = c->bo_handle;
+	pk[0].launch.args_off = 0;
+
+	memset(&db, 0, sizeof(db));
+	db.qid = c->qid;
+	db.put = sizeof(*pk);
+	if (check(fd, &db, DRM_IOCTL_VGPU_DOORBELL, "doorbell(launch)"))
+		return -1;
+	*seqno = db.seqno;
+	printf("  launch: q#%u prio-queue grid=%u block=%u -> seq#%u\n",
+	       c->qid, F_GRID, F_BLOCK, db.seqno);
+	return 0;
+}
+
+/*
+ * Wait until the engine has actually PICKED UP a submission: a doorbell
+ * only queues work, and waking a kworker is asynchronous. Preempting a
+ * launch needs a RUNNING victim, so the test must not assume the engine
+ * started it — the driver says so in the "pending" debugfs view, which
+ * lists a launch in flight with its resume point. This waits for a
+ * state; it does not pace the mechanism: the pause itself still happens
+ * at an instruction boundary inside the running launch.
+ */
+static int f_wait_inflight(uint32_t seqno, uint32_t *block, uint32_t *warp)
+{
+	static char buf[2048];
+	char want[64], *p;
+	int fd, i, found = -1;
+
+	snprintf(want, sizeof(want), "in-flight seq#%u", seqno);
+	fd = open("/sys/kernel/debug/vgpu/pending", O_RDONLY);
+	if (fd < 0)
+		return -1;
+	for (i = 0; i < 100; i++) {
+		ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+
+		if (n > 0) {
+			unsigned s = 0, b = 0, g = 0, w = 0, pc = 0;
+
+			buf[n] = '\0';
+			if (strstr(buf, want)) {
+				found = 0;
+				p = strstr(buf, "launch");
+				if (p && sscanf(p,
+						" launch  seq#%u at block %u/%u warp %u pc %u",
+						&s, &b, &g, &w, &pc) >= 5 &&
+				    s == seqno) {
+					*block = b;
+					*warp = w;
+				}
+				break;
+			}
+		}
+		usleep(200);
+	}
+	close(fd);
+	return found;
+}
+
+/* every thread must have computed out[i] = a*in[i] + b */
+static int f_verify(struct f_ctx *c, const char *who)
+{
+	int i;
+
+	for (i = 0; i < F_N_ELEMS; i++) {
+		uint32_t want = c->a * c->args[F_PARAM_WORDS + i] + c->b;
+		uint32_t got = c->args[F_PARAM_WORDS + F_N_ELEMS + i];
+
+		if (got != want) {
+			fprintf(stderr,
+				"FAIL: %s out[%d] = %u, want %u (preemption lost state?)\n",
+				who, i, got, want);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int run_preempt(void)
+{
+	int fd, rc = 1;
+	uint32_t kid = 0, seqA, seqB, seqC, seqD;
+	uint32_t blkC = 0, warpC = 0;
+	unsigned long long sw0, pr0, sw1, pr1, d_sw, d_pr;
+	struct f_ctx ca, cb, cc, cd;
+	struct vgpu_module_load ml;
+
+	static const struct vgpu_instr code[] = {
+		{ .op = VGPU_ISA_MOVI, .dst = 15, .a = 0 },	/* r15 = 0 */
+		{ .op = VGPU_ISA_LD,   .dst = 1,  .a = 15, .b = 1 },
+		{ .op = VGPU_ISA_LD,   .dst = 2,  .a = 15, .b = 2 },
+		{ .op = VGPU_ISA_LD,   .dst = 3,  .a = 15, .b = 3 },
+		{ .op = VGPU_ISA_LD,   .dst = 4,  .a = 15, .b = 4 },
+		{ .op = VGPU_ISA_ADD,  .dst = 5,  .a = 3,  .b = 0 },
+		{ .op = VGPU_ISA_LD,   .dst = 6,  .a = 5,  .b = 0 },
+		{ .op = VGPU_ISA_MUL,  .dst = 7,  .a = 1,  .b = 6 },
+		{ .op = VGPU_ISA_ADD,  .dst = 8,  .a = 7,  .b = 2 },
+		{ .op = VGPU_ISA_ADD,  .dst = 9,  .a = 4,  .b = 0 },
+		{ .op = VGPU_ISA_ST,   .dst = 8,  .a = 9,  .b = 0 },
+		{ .op = VGPU_ISA_EXIT },
+	};
+
+	fd = open("/dev/dri/renderD128", O_RDWR);
+	if (fd < 0)
+		fd = open("/dev/dri/card0", O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "FAIL: open: %s\n", strerror(errno));
+		return 1;
+	}
+
+	memset(&ml, 0, sizeof(ml));
+	ml.nregs = 16;
+	ml.smem = 0;
+	ml.ninstr = sizeof(code) / sizeof(code[0]);
+	ml.code = (uint64_t)(uintptr_t)code;
+	if (check(fd, &ml, DRM_IOCTL_VGPU_MODULE_LOAD, "module_load"))
+		goto out;
+	kid = ml.kid;
+
+	/* ---- (a) timeslicing: two contexts, same priority ----------- */
+	if (f_ctx_create(fd, 1, &ca, 3, 7) ||
+	    f_ctx_create(fd, 1, &cb, 5, 11))
+		goto out;
+
+	sw0 = f_stat("ctx switches");
+	pr0 = f_stat("preemptions");
+	printf("=== phase F/a: 2 contexts (prio=1) x grid=%u block=%u on ONE compute engine ===\n",
+	       F_GRID, F_BLOCK);
+	if (f_launch(fd, kid, &ca, &seqA) || f_launch(fd, kid, &cb, &seqB))
+		goto out;
+	if (wait_seqno(fd, seqA, 30000) != 0 ||
+	    wait_seqno(fd, seqB, 30000) != 0) {
+		fprintf(stderr, "FAIL: timeslice launches did not complete\n");
+		goto out;
+	}
+	sw1 = f_stat("ctx switches");
+	pr1 = f_stat("preemptions");
+	d_sw = sw1 - sw0;
+	d_pr = pr1 - pr0;
+	if (f_verify(&ca, "ctx A") || f_verify(&cb, "ctx B"))
+		goto out;
+	printf("[pid %d] PASS: timeslicing: both %u-block grids correct, "
+	       "engine interleaved them (ctx switches +%llu, preemptions +%llu)\n",
+	       (int)getpid(), F_GRID, d_sw, d_pr);
+	if (!d_sw) {
+		fprintf(stderr,
+			"FAIL: no context switches: the engine ran one context to completion\n");
+		goto out;
+	}
+
+	/* ---- (b) preemption: prio=2 arrives while prio=0 runs ------ */
+	if (f_ctx_create(fd, 0, &cc, 2, 1) ||
+	    f_ctx_create(fd, 2, &cd, 9, 4))
+		goto out;
+
+	sw0 = f_stat("ctx switches");
+	pr0 = f_stat("preemptions");
+	printf("=== phase F/b: prio=2 launch submitted while prio=0 is in flight ===\n");
+	/*
+	 * The low-priority launch is queued first and starts running; the
+	 * high-priority doorbell follows, so it lands while the low launch
+	 * is mid-grid and has to preempt it (a launch is milliseconds of
+	 * modelled work — no sleep needed to make them overlap).
+	 */
+	if (f_launch(fd, kid, &cc, &seqC))
+		goto out;
+	if (f_wait_inflight(seqC, &blkC, &warpC)) {
+		fprintf(stderr,
+			"FAIL: low-priority launch never started running\n");
+		goto out;
+	}
+	printf("  low-prio seq#%u is running at block %u/%u warp %u -> submit prio=2\n",
+	       seqC, blkC, F_GRID, warpC);
+	if (f_launch(fd, kid, &cd, &seqD))
+		goto out;
+	if (wait_seqno(fd, seqD, 30000) != 0 ||
+	    wait_seqno(fd, seqC, 30000) != 0) {
+		fprintf(stderr, "FAIL: preemption launches did not complete\n");
+		goto out;
+	}
+	sw1 = f_stat("ctx switches");
+	pr1 = f_stat("preemptions");
+	d_sw = sw1 - sw0;
+	d_pr = pr1 - pr0;
+	if (f_verify(&cc, "low prio") || f_verify(&cd, "high prio"))
+		goto out;
+	printf("[pid %d] PASS: preemption: prio=0 paused for prio=2 "
+	       "(ctx switches +%llu, preemptions +%llu); both results correct\n",
+	       (int)getpid(), d_sw, d_pr);
+	if (!d_pr) {
+		fprintf(stderr,
+			"FAIL: no preemption: the high-priority launch did not interrupt the running low-priority one\n");
+		goto out;
+	}
+
+	printf("preemption + timeslicing: all passed\n");
+	rc = 0;
+
+out:
+	close(fd);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	int m = 1, i;
@@ -702,6 +1012,9 @@ int main(int argc, char **argv)
 
 	if (argc > 1 && !strcmp(argv[1], "-e"))
 		return run_negative() ? 1 : 0;
+
+	if (argc > 1 && !strcmp(argv[1], "-f"))
+		return run_preempt() ? 1 : 0;
 
 	if (m == 1)
 		return run_one(0) ? 1 : 0;
