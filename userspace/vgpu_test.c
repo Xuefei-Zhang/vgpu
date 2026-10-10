@@ -19,6 +19,11 @@
  *        (streams + per-engine command classes).
  * -e:   the negative paths only (rejected doorbell, engine faults,
  * ring full) — each must fail the exact way DESIGN.md §10 says.
+ * -g:   phase G: memory-semantics sync. Completion is discovered by
+ *        POLLING MMAP'ED MEMORY (timeline semaphore + event slots) —
+ *        no VGPU_WAIT anywhere in that path — and a 4-node graph
+ *        (copy -> launch -> copy -> signal) is submitted with ONE
+ *        doorbell and measured against 4 separate doorbells.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -30,6 +35,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "drm.h"

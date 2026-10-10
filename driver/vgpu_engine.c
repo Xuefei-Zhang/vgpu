@@ -59,14 +59,19 @@ const struct dma_fence_ops vgpu_fence_ops = {
  * (dma_map_single / dma_unmap_single), one page at a time. On x86
  * without an IOMMU the mapping is a no-op; with an IOMMU (or on ARM)
  * this is where real device-to-memory translation happens.
+ *
+ * Takes the page arrays explicitly so a graph node (which resolves its
+ * own buffers) can reuse it — the single-BLIT submission wrapper below
+ * is what saw the light of day first.
  */
-static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
+void vgpu_blit_pages(struct vgpu *v, struct page **src_pages,
+		     struct page **dst_pages, u32 npages, u32 off)
 {
 	u32 i;
 
-	for (i = 0; i < sub->nblit_pages; i++) {
-		struct page *sp = sub->src_pages[sub->blit_off + i];
-		struct page *dp = sub->dst_pages[sub->blit_off + i];
+	for (i = 0; i < npages; i++) {
+		struct page *sp = src_pages[off + i];
+		struct page *dp = dst_pages[off + i];
 		void *sv = kmap_local_page(sp);
 		void *dv = kmap_local_page(dp);
 		dma_addr_t saddr, daddr;
@@ -84,6 +89,13 @@ static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
 		kunmap_local(dv);
 		kunmap_local(sv);
 	}
+}
+
+static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
+{
+	struct vgpu_blit_ref *b = &sub->blit;
+
+	vgpu_blit_pages(v, b->src_pages, b->dst_pages, b->npages, b->blit_off);
 }
 
 /*
@@ -137,6 +149,28 @@ static void vgpu_fetch_packets(struct vgpu *v, struct vgpu_submission *sub)
 		case VGPU_PKT_LAUNCH:
 			c->opcode = VGPU_OP_LAUNCH;
 			break;
+		/*
+		 * Phase G: the sync packets carry no engine-side state
+		 * beyond which word of the semaphore page and what
+		 * value — the command struct's SET fields are exactly
+		 * that shape (and the resolution of the page itself
+		 * happened in the doorbell).
+		 */
+		case VGPU_PKT_SIGNAL_TIMELINE:
+			c->opcode = VGPU_OP_SIGNAL_TIMELINE;
+			c->set_off = pk[i].timeline.sem_off;
+			c->set_data = pk[i].timeline.value;
+			break;
+		case VGPU_PKT_WAIT_TIMELINE:
+			c->opcode = VGPU_OP_WAIT_TIMELINE;
+			c->set_off = pk[i].timeline.sem_off;
+			c->set_data = pk[i].timeline.value;
+			break;
+		case VGPU_PKT_WRITE_EVENT:
+			c->opcode = VGPU_OP_WRITE_EVENT;
+			c->set_off = pk[i].timeline.sem_off;
+			c->set_data = pk[i].timeline.value;
+			break;
 		default:
 			c->opcode = 0xff;	/* engine reports the fault */
 		}
@@ -150,6 +184,12 @@ static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 	struct vgpu_cmd *cmds =
 		(struct vgpu_cmd *)(v->scratch[sub->engine] + sub->cmds_off);
 	u32 i;
+
+	/* VGPU_GRAPH: nodes were resolved and ordered by the ioctl */
+	if (sub->gnodes) {
+		vgpu_graph_execute(v, sub);
+		return;
+	}
 
 	for (i = 0; i < sub->ncmds; i++) {
 		struct vgpu_cmd *c = &cmds[i];
@@ -169,7 +209,7 @@ static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 			*((u32 *)v->regs + c->set_off / 4) = c->set_data;
 			break;
 		case VGPU_OP_BLIT:
-			if (!sub->src_obj) {
+			if (!sub->blit.src_obj) {
 				if (!sub->error)
 					sub->error = -EINVAL;
 				break;
@@ -178,6 +218,17 @@ static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 			break;
 		case VGPU_OP_LAUNCH:
 			vgpu_compute_run(v, sub);
+			break;
+		/*
+		 * Phase G: the stream can keep going after a signal — a
+		 * semaphore write is just another packet, and the whole
+		 * point is that more work can depend on it.
+		 */
+		case VGPU_OP_SIGNAL_TIMELINE:
+		case VGPU_OP_WAIT_TIMELINE:
+		case VGPU_OP_WRITE_EVENT:
+			vgpu_sync_exec_cmd(v, sub, c->opcode, c->set_off,
+					   c->set_data);
 			break;
 		default:
 			if (!sub->error)
@@ -335,26 +386,22 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 	if (cmpxchg(&sub->finished, 0, 1))
 		return;
 
+	/*
+	 * Phase G first: a graph owns its own resolved resources (per
+	 * node), and the semaphore page is pinned per submission. Both
+	 * are released (and the pointers cleared) here, so the generic
+	 * BLIT/launch cleanup below only ever sees what it resolved.
+	 */
+	vgpu_sync_release(v, sub);
+
 	/* release the launch's argument buffer (unpin + object ref) */
 	if (sub->args_obj) {
 		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
 		drm_gem_object_put(sub->args_obj);
 		sub->args_obj = NULL;
 	}
-	if (sub->src_obj) {
-		u32 i;
-
-		for (i = 0; i < sub->nblit_pages; i++) {
-			put_page(sub->src_pages[sub->blit_off + i]);
-			put_page(sub->dst_pages[sub->blit_off + i]);
-		}
-		kfree(sub->src_pages);
-		kfree(sub->dst_pages);
-		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->src_obj));
-		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->dst_obj));
-		drm_gem_object_put(sub->src_obj);
-		drm_gem_object_put(sub->dst_obj);
-	}
+	/* release the BLIT's pages + pins (doorbell path) */
+	vgpu_blit_unref(v, &sub->blit);
 
 	mutex_lock(&v->fence_mutex);
 	fence = idr_find(&v->fence_idr, sub->seqno);

@@ -52,11 +52,41 @@ struct vgpu_fence {
 };
 
 /*
- * One doorbell. Two shapes:
+ * A resolved BLIT: the handles became objects (pinned), the pages are
+ * captured, and the range inside them is recorded. The doorbell does
+ * this once per COPY packet; a graph node uses the very same struct,
+ * which is why it is shared instead of living in the submission.
+ */
+struct vgpu_blit_ref {
+	struct drm_gem_object *src_obj, *dst_obj;
+	struct page **src_pages, **dst_pages;
+	u32 npages;
+	u32 blit_off;		/* page index of the range inside the BOs */
+};
+
+/*
+ * One graph node, fully resolved by the GRAPH ioctl: handles became
+ * objects (pinned), the kernel id became a struct vgpu_kernel. The
+ * engine just walks order[] and executes these.
+ */
+struct vgpu_gnode {
+	u32 type;			/* enum vgpu_packet_type */
+	struct vgpu_blit_ref blit;		/* VGPU_PKT_COPY */
+	struct vgpu_kernel *kernel;		/* VGPU_PKT_LAUNCH */
+	struct drm_gem_object *args_obj;	/* pinned argument buffer */
+	u32 args_off, grid, block;
+	u32 sem_off;				/* sync packets */
+	u64 value;
+};
+
+/*
+ * One doorbell. Three shapes:
  *  - CS ioctl (legacy): commands are fetched into scratch at submit
  *    time, ncmds set, npkts == 0.
  *  - DOORBELL ioctl (phase B): carries a packet RANGE in the queue
  *    ring; the engine fetches and decodes it, setting ncmds from npkts.
+ *  - GRAPH ioctl (phase G): gnodes/order carry resolved nodes; the
+ *    queue's ring is not touched at all — one doorbell for the DAG.
  */
 struct vgpu_submission {
 	struct list_head node;		/* engine_pending[] or in_flight */
@@ -80,10 +110,7 @@ struct vgpu_submission {
 	unsigned long submit_jiffies;
 
 	/* at most one BLIT per submission, resolved at submit time */
-	struct drm_gem_object *src_obj, *dst_obj;
-	struct page **src_pages, **dst_pages;
-	u32 nblit_pages;
-	u32 blit_off;		/* page index of the blit range inside the BOs */
+	struct vgpu_blit_ref blit;
 	struct work_struct finish_work;	/* bottom half: one work per sub */
 
 	/* compute: a LAUNCH packet resolved at submit time */
@@ -91,6 +118,18 @@ struct vgpu_submission {
 	struct drm_gem_object *args_obj;	/* the argument buffer (pinned) */
 	u32 args_off;
 	u32 grid, block;
+
+	/*
+	 * Phase G: the semaphore page (pinned for this submission, like
+	 * the argument buffer) and, for a VGPU_GRAPH submission, the
+	 * resolved node array. Everything the engine needs is resolved
+	 * at submit time, so the graph path never touches a handle.
+	 */
+	struct drm_gem_object *sem_obj;		/* pinned semaphore page */
+	struct vgpu_gnode *gnodes;		/* VGPU_GRAPH only */
+	u32 *order;				/* topological node order */
+	u32 ngnodes;
+	bool is_graph;
 };
 
 /*
@@ -153,6 +192,15 @@ struct vgpu_file {
 	struct vgpu *vf_dev;
 	u32 next_qid;
 	u32 next_kid;
+	/*
+	 * Phase G: this context's semaphore page. Only the handle and
+	 * the byte offset of the timeline word are remembered — no
+	 * reference is taken here; each submission resolves (and pins)
+	 * it the same way it resolves a BLIT buffer, so the object's
+	 * lifetime stays tied to the submission, not to the fd.
+	 */
+	u32 sem_handle;
+	u32 sem_off;
 };
 
 struct vgpu {
@@ -205,6 +253,9 @@ struct vgpu {
 	u64 stats_submitted, stats_completed, stats_errors;
 	struct dentry *dbg;
 
+	/* phase G: memory-semantics synchronization counters */
+	u64 stats_graphs, stats_signals, stats_waits, stats_events;
+
 	/* compute statistics (debugfs "compute") */
 	u64 cs_kernels_launched, cs_blocks, cs_warps, cs_threads;
 	u64 cs_instrs, cs_mem_ops, cs_waves;
@@ -217,9 +268,37 @@ struct vgpu {
 
 #define VGPU_NREGS_MAX		16
 
+/* how long the engine stalls on a WAIT_TIMELINE before giving up */
+#define VGPU_TIMELINE_WAIT_MS	2000
+
+/* word-addressed access into a pinned BO (vgpu_sync.c, vgpu_compute.c) */
+#define VGPU_WORDS_PER_PAGE	(PAGE_SIZE / sizeof(u32))
+
 /* vgpu_compute.c */
 struct vgpu_instr;
 void vgpu_compute_run(struct vgpu *v, struct vgpu_submission *sub);
+
+/* vgpu_drv.c: BLIT resolution, shared by the doorbell and the graph */
+struct vgpu_queue *vgpu_queue_find(struct vgpu_file *vf, u32 qid);
+struct vgpu_kernel *vgpu_kernel_find(struct vgpu_file *vf, u32 kid);
+u32 vgpu_pkt_opcode(u32 type);
+bool vgpu_pkt_is_sync(u32 type);
+int vgpu_blit_pin(struct drm_file *file, struct vgpu_blit_ref *ref,
+		  u32 src_bo, u32 dst_bo, u32 off, u32 len);
+void vgpu_blit_unref(struct vgpu *v, struct vgpu_blit_ref *ref);
+
+/* vgpu_sync.c (phase G) */
+int vgpu_sem_bind_ioctl(struct drm_device *dev, void *data,
+			struct drm_file *file);
+int vgpu_graph_ioctl(struct drm_device *dev, void *data,
+		     struct drm_file *file);
+int vgpu_timeline_resolve(struct drm_file *file, struct vgpu_submission *sub,
+			  u32 sem_bo, u32 sem_off);
+void vgpu_sync_exec_cmd(struct vgpu *v, struct vgpu_submission *sub,
+			u32 op, u32 sem_off, u64 val);
+void vgpu_graph_execute(struct vgpu *v, struct vgpu_submission *sub);
+void vgpu_sync_release(struct vgpu *v, struct vgpu_submission *sub);
+u32 vgpu_bo_word(struct drm_gem_object *obj, u32 word, bool write, u32 val);
 
 /* vgpu_engine.c */
 extern const struct dma_fence_ops vgpu_fence_ops;
@@ -227,4 +306,6 @@ void vgpu_engine_init(struct vgpu *v);
 void vgpu_engine_fini(struct vgpu *v);
 irqreturn_t vgpu_irq_handler(int irq, void *dev_id);
 void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub);
+void vgpu_blit_pages(struct vgpu *v, struct page **src_pages,
+		     struct page **dst_pages, u32 npages, u32 off);
 #endif /* _VGPU_DRV_H_ */

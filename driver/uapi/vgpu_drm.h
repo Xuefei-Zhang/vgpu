@@ -36,7 +36,7 @@ struct vgpu_cmd {
 	__u32 length;	/* bytes, page aligned, <= 64K */
 	__u32 set_off;	/* (SET) byte offset into the MMIO region */
 	__u64 set_data;	/* (SET) value the "GPU" writes into MMIO */
-	__u32 pad2[2];
+	__u32 pad2[2];		/* (SET/SIGNAL/WAIT/EVENT) see the opcodes */
 };
 
 enum vgpu_opcodes {
@@ -44,6 +44,23 @@ enum vgpu_opcodes {
 	VGPU_OP_BLIT	= 1,	/* DMA copy: src_bo@src_off -> dst_bo@dst_off */
 	VGPU_OP_SET	= 2,	/* write set_data into the MMIO region at set_off */
 	VGPU_OP_LAUNCH	= 3,	/* run a compute kernel (phase D: grid x block) */
+	/*
+	 * Phase G: the memory-semantics synchronization vocabulary. These
+	 * three operate on a *semaphore page* (see VGPU_SEM_BIND), not on
+	 * the MMIO region: the "device" writes a word the CPU can poll,
+	 * instead of the CPU asking the kernel to wait for it.
+	 *
+	 * They exist only on the packet path (VGPU_DOORBELL / VGPU_GRAPH):
+	 * the legacy 64B command has no field that names the semaphore
+	 * page, so VGPU_CS rejects them (see vgpu_cs_ioctl).
+	 *
+	 * In the decoded command struct the operands reuse the SET fields:
+	 * set_off = byte offset of the word in the semaphore page,
+	 * set_data = the value (written, or waited for).
+	 */
+	VGPU_OP_SIGNAL_TIMELINE	= 4,	/* word = value */
+	VGPU_OP_WAIT_TIMELINE	= 5,	/* stall until word >= value */
+	VGPU_OP_WRITE_EVENT	= 6,	/* event slot = value */
 };
 
 /*
@@ -86,6 +103,91 @@ struct vgpu_module_load {
 /* VGPU_MODULE_DESTROY: retire a kernel. */
 struct vgpu_module_destroy {
 	__u32 kid;		/* in */
+	__u32 pad;
+};
+
+/*
+ * VGPU_SEM_BIND: install this fd's semaphore page (phase G).
+ *
+ * The app allocates a shmem BO ("VRAM"), mmaps it, and hands the driver
+ * its handle + the byte offset of the timeline word. From then on the
+ * driver treats that word as the context's timeline value: the engine
+ * writes it (SIGNAL_TIMELINE) and stalls on it (WAIT_TIMELINE), while
+ * the CPU just reads the mmap. This is the whole of "memory-semantics
+ * synchronization": the completion lives in memory both sides can see,
+ * not in a syscall.
+ *
+ * The binding is validated once here (handle must exist, offset must be
+ * a word inside the BO); the packets carry the handle so a submission
+ * is self-describing, but the driver rejects any handle that is not
+ * the bound one — a GPU packet naming undeclared memory is a bug.
+ */
+struct vgpu_sem_bind {
+	__u32 bo_handle;	/* in, the semaphore page */
+	__u32 sem_off;		/* in, byte offset of the timeline word */
+	__u32 bound;		/* out, 1 once bound */
+	__u32 pad;
+};
+
+/*
+ * VGPU_GRAPH: submit a DAG of nodes with ONE doorbell (phase G).
+ *
+ * A node is one unit of work (COPY / LAUNCH / NOP / a timeline signal).
+ * The dependency edges say which nodes must retire first; the driver
+ * topologically sorts them at submit time and the engine runs them in
+ * that order, signalling ONE fence at the end.
+ *
+ * The point being measured: N separate doorbells become 1 syscall, and
+ * the dependency structure becomes explicit data instead of "submit
+ * them in this order and hope".
+ *
+ * Edges may be spelled two equivalent ways — as predecessor lists
+ * inside the node descriptors (ndeps/deps[]), or as an explicit
+ * (from, to) array. Give one or the other.
+ */
+#define VGPU_GRAPH_MAX_NODES	16
+#define VGPU_GRAPH_MAX_DEPS	3
+#define VGPU_GRAPH_MAX_EDGES	32
+
+struct vgpu_graph_node {
+	__u32 type;			/* enum vgpu_packet_type (work nodes) */
+	__u32 ndeps;			/* how many deps[] are used */
+	__u32 deps[VGPU_GRAPH_MAX_DEPS];	/* node indices that run first */
+	union {
+		struct {
+			__u32 src_bo;	/* GEM handle of the source */
+			__u32 dst_bo;	/* GEM handle of the destination */
+			__u32 off;	/* page-aligned offset in both BOs */
+			__u32 len;	/* bytes, page aligned, <= 64K */
+		} copy;
+		struct {
+			__u32 kid;	/* kernel id (VGPU_MODULE_LOAD) */
+			__u32 grid;
+			__u32 block;
+			__u32 args_bo;	/* GEM handle of the argument buffer */
+			__u32 args_off;
+		} launch;
+		struct {
+			__u32 sem_bo;	/* GEM handle of the semaphore page */
+			__u32 sem_off;	/* byte offset of the word */
+			__u32 pad;
+			__u64 value;
+		} sem;
+	};
+};
+
+struct vgpu_graph_edge {
+	__u32 from;			/* node index that must retire first */
+	__u32 to;			/* node index that runs after it */
+};
+
+struct vgpu_graph_submit {
+	__u64 nodes;		/* in: struct vgpu_graph_node[nnodes] */
+	__u64 edges;		/* in: struct vgpu_graph_edge[nedges], or 0 */
+	__u32 qid;		/* in, target queue */
+	__u32 nnodes;		/* in, 1..VGPU_GRAPH_MAX_NODES */
+	__u32 nedges;		/* in, 0..VGPU_GRAPH_MAX_EDGES */
+	__u32 seqno;		/* out, one fence for the whole graph */
 	__u32 pad;
 };
 
@@ -149,6 +251,17 @@ enum vgpu_packet_type {
 	VGPU_PKT_COPY		= 1,	/* BO->BO DMA */
 	VGPU_PKT_WRITE_REG	= 2,	/* write into the MMIO region */
 	VGPU_PKT_LAUNCH		= 3,	/* run a compute kernel */
+	/*
+	 * Phase G: memory-semantics sync. All three name a word in the
+	 * semaphore page bound by VGPU_SEM_BIND. Word 0 of that page is
+	 * conventionally the timeline value; any other word can serve as
+	 * an event slot. The engine writes the word (SIGNAL/WRITE_EVENT)
+	 * or stalls on it (WAIT) — and userspace discovers all of it by
+	 * POLLING THE MMAP, with no ioctl in the completion path.
+	 */
+	VGPU_PKT_SIGNAL_TIMELINE	= 4,
+	VGPU_PKT_WAIT_TIMELINE		= 5,
+	VGPU_PKT_WRITE_EVENT		= 6,
 };
 
 struct vgpu_packet {
@@ -178,6 +291,19 @@ struct vgpu_packet {
 			__u32 args_off;	/* byte offset of the args inside it */
 			__u32 pad[3];
 		} launch;
+		/*
+		 * Phase G sync operands: which word of the bound
+		 * semaphore page, and the value. The handle is carried
+		 * per packet (that is what a GPU VA / semaphore address
+		 * is in a real packet) and must name the page the
+		 * context bound with VGPU_SEM_BIND.
+		 */
+		struct {
+			__u32 sem_bo;	/* GEM handle of the semaphore page */
+			__u32 sem_off;	/* byte offset of the word (4-aligned) */
+			__u32 pad;
+			__u64 value;	/* written (SIGNAL/EVENT) or awaited */
+		} timeline;
 	};
 };
 
@@ -215,7 +341,11 @@ struct vgpu_query {
 	__u32 r_seqno;		/* out, MMIO seqno register */
 	__u32 r_error;		/* out, MMIO error register */
 	__u32 r_user;		/* out, MMIO user register (SET target) */
-	__u32 pad;
+	/* phase G: counters for the memory-semantics vocabulary */
+	__u32 graphs;		/* out, graphs submitted (one doorbell each) */
+	__u32 signals;		/* out, timeline values written by the engine */
+	__u32 waits;		/* out, timeline waits executed */
+	__u32 events;		/* out, event slots written */
 };
 
 #define VGPU_IOC(nr)		(DRM_COMMAND_BASE + (nr))
@@ -230,6 +360,8 @@ struct vgpu_query {
 #define DRM_VGPU_DOORBELL	0x08
 #define DRM_VGPU_MODULE_LOAD	0x09
 #define DRM_VGPU_MODULE_DESTROY	0x0a
+#define DRM_VGPU_SEM_BIND	0x0b
+#define DRM_VGPU_GRAPH		0x0c
 
 #define DRM_IOCTL_VGPU_BO_CREATE	DRM_IOWR(VGPU_IOC(DRM_VGPU_BO_CREATE), struct vgpu_bo_create)
 #define DRM_IOCTL_VGPU_RING_GET		DRM_IOWR(VGPU_IOC(DRM_VGPU_RING_GET), struct vgpu_ring_get)
@@ -241,6 +373,8 @@ struct vgpu_query {
 #define DRM_IOCTL_VGPU_DOORBELL		DRM_IOWR(VGPU_IOC(DRM_VGPU_DOORBELL), struct vgpu_doorbell)
 #define DRM_IOCTL_VGPU_MODULE_LOAD	DRM_IOWR(VGPU_IOC(DRM_VGPU_MODULE_LOAD), struct vgpu_module_load)
 #define DRM_IOCTL_VGPU_MODULE_DESTROY	DRM_IOWR(VGPU_IOC(DRM_VGPU_MODULE_DESTROY), struct vgpu_module_destroy)
+#define DRM_IOCTL_VGPU_SEM_BIND		DRM_IOWR(VGPU_IOC(DRM_VGPU_SEM_BIND), struct vgpu_sem_bind)
+#define DRM_IOCTL_VGPU_GRAPH		DRM_IOWR(VGPU_IOC(DRM_VGPU_GRAPH), struct vgpu_graph_submit)
 
 #if defined(__cplusplus)
 }

@@ -26,7 +26,6 @@
 #define VGPU_NREGS		16
 
 #define R(i)			regs[(i) & (VGPU_NREGS - 1)]
-#define VGPU_WORDS_PER_PAGE	(PAGE_SIZE / sizeof(u32))
 
 /*
  * One global-memory word, through the argument BO's pages. The BO is
@@ -39,21 +38,7 @@
 static u32 vgpu_mem_word(struct vgpu_submission *sub, u32 addr, bool write,
 			 u32 val)
 {
-	struct drm_gem_shmem_object *sh =
-		to_drm_gem_shmem_obj(sub->args_obj);
-	struct page *page;
-	u32 *p;
-
-	page = sh->pages[addr / VGPU_WORDS_PER_PAGE];
-	if (!page)
-		return 0;
-	p = kmap_local_page(page);
-	if (write)
-		p[addr % VGPU_WORDS_PER_PAGE] = val;
-	else
-		val = p[addr % VGPU_WORDS_PER_PAGE];
-	kunmap_local(p);
-	return val;
+	return vgpu_bo_word(sub->args_obj, addr, write, val);
 }
 
 /*

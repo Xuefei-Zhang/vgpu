@@ -39,6 +39,11 @@ static int vgpu_module_load_ioctl(struct drm_device *dev, void *data,
 				  struct drm_file *file);
 static int vgpu_module_destroy_ioctl(struct drm_device *dev, void *data,
 				     struct drm_file *file);
+/* phase G: vgpu_sync.c */
+int vgpu_sem_bind_ioctl(struct drm_device *dev, void *data,
+			struct drm_file *file);
+int vgpu_graph_ioctl(struct drm_device *dev, void *data,
+		     struct drm_file *file);
 static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 			 struct drm_file *file);
 static int vgpu_wait_ioctl(struct drm_device *dev, void *data,
@@ -57,6 +62,8 @@ static const struct drm_ioctl_desc vgpu_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(VGPU_DOORBELL, vgpu_doorbell_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(VGPU_MODULE_LOAD, vgpu_module_load_ioctl, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(VGPU_MODULE_DESTROY, vgpu_module_destroy_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VGPU_SEM_BIND, vgpu_sem_bind_ioctl, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(VGPU_GRAPH, vgpu_graph_ioctl, DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(vgpu_drm_fops);
@@ -176,6 +183,30 @@ static int vgpu_dbg_compute_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(vgpu_dbg_compute);
 
+/*
+ * Phase G's counters: how much of the device's synchronization is
+ * memory-semantics (timeline values written in BO memory the CPU
+ * polls) rather than kernel-side waits.
+ */
+static int vgpu_dbg_sync_show(struct seq_file *s, void *unused)
+{
+	struct vgpu *v = s->private;
+	unsigned long flags;
+
+	spin_lock_irqsave(&v->lock, flags);
+	seq_printf(s, "graphs    %llu  (one doorbell per DAG)\n",
+		   v->stats_graphs);
+	seq_printf(s, "signals   %llu  (timeline values written)\n",
+		   v->stats_signals);
+	seq_printf(s, "waits     %llu  (timeline values waited on)\n",
+		   v->stats_waits);
+	seq_printf(s, "events    %llu  (event slots written)\n",
+		   v->stats_events);
+	spin_unlock_irqrestore(&v->lock, flags);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(vgpu_dbg_sync);
+
 static int vgpu_dbg_pending_show(struct seq_file *s, void *unused)
 {
 	struct vgpu *v = s->private;
@@ -194,8 +225,9 @@ static int vgpu_dbg_pending_show(struct seq_file *s, void *unused)
 		}
 	}
 	list_for_each_entry(sub, &v->in_flight, node) {
-		seq_printf(s, "in-flight seq#%u ncmds=%u err=%d\n",
-			   sub->seqno, sub->ncmds, (int)sub->error);
+		seq_printf(s, "in-flight seq#%u ncmds=%u err=%d%s\n",
+			   sub->seqno, sub->ncmds, (int)sub->error,
+			   sub->is_graph ? " graph" : "");
 		any = true;
 	}
 	spin_unlock_irqrestore(&v->lock, flags);
@@ -284,6 +316,7 @@ static int vgpu_probe(struct platform_device *pdev)
 	debugfs_create_file("stats", 0444, v->dbg, v, &vgpu_dbg_stats_fops);
 	debugfs_create_file("queues", 0444, v->dbg, v, &vgpu_dbg_queues_fops);
 	debugfs_create_file("compute", 0444, v->dbg, v, &vgpu_dbg_compute_fops);
+	debugfs_create_file("sync", 0444, v->dbg, v, &vgpu_dbg_sync_fops);
 	debugfs_create_file("pending", 0444, v->dbg, v, &vgpu_dbg_pending_fops);
 	debugfs_create_file("regs", 0444, v->dbg, v, &vgpu_dbg_regs_fops);
 
@@ -305,6 +338,33 @@ err_devres:
 /* ------------------------------------------------- the queue subsystem */
 
 /*
+ * Packet type -> the command class an engine accepts. The packet
+ * vocabulary grew past the legacy opcodes in phase B; the engine
+ * class check is still about *what kind of work* it is, so translate
+ * rather than duplicate the table.
+ */
+u32 vgpu_pkt_opcode(u32 type)
+{
+	switch (type) {
+	case VGPU_PKT_COPY:		return VGPU_OP_BLIT;
+	case VGPU_PKT_WRITE_REG:	return VGPU_OP_SET;
+	case VGPU_PKT_LAUNCH:		return VGPU_OP_LAUNCH;
+	case VGPU_PKT_SIGNAL_TIMELINE:	return VGPU_OP_SIGNAL_TIMELINE;
+	case VGPU_PKT_WAIT_TIMELINE:	return VGPU_OP_WAIT_TIMELINE;
+	case VGPU_PKT_WRITE_EVENT:	return VGPU_OP_WRITE_EVENT;
+	default:			return VGPU_OP_NOP;
+	}
+}
+
+/* the phase G memory-semantics packets */
+bool vgpu_pkt_is_sync(u32 type)
+{
+	return type == VGPU_PKT_SIGNAL_TIMELINE ||
+	       type == VGPU_PKT_WAIT_TIMELINE ||
+	       type == VGPU_PKT_WRITE_EVENT;
+}
+
+/*
  * Which commands does an engine accept? A real device's engines accept
  * disjoint command classes (a DMA engine cannot execute a shader; a
  * compute engine is not where you put a blit). Rejecting at the
@@ -315,18 +375,31 @@ static bool vgpu_engine_allows(u32 engine, u32 opcode)
 {
 	switch (engine) {
 	case VGPU_ENGINE_COPY:
-		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_BLIT;
+		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_BLIT ||
+		       opcode == VGPU_OP_SIGNAL_TIMELINE ||
+		       opcode == VGPU_OP_WAIT_TIMELINE ||
+		       opcode == VGPU_OP_WRITE_EVENT;
 	case VGPU_ENGINE_COMPUTE:
 		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_SET ||
-		       opcode == VGPU_OP_LAUNCH;
+		       opcode == VGPU_OP_LAUNCH ||
+		       opcode == VGPU_OP_SIGNAL_TIMELINE ||
+		       opcode == VGPU_OP_WAIT_TIMELINE ||
+		       opcode == VGPU_OP_WRITE_EVENT;
 	case VGPU_ENGINE_GFX:
 		return opcode == VGPU_OP_NOP || opcode == VGPU_OP_BLIT ||
-		       opcode == VGPU_OP_SET || opcode == VGPU_OP_LAUNCH;
+		       opcode == VGPU_OP_SET || opcode == VGPU_OP_LAUNCH ||
+		       opcode == VGPU_OP_SIGNAL_TIMELINE ||
+		       opcode == VGPU_OP_WAIT_TIMELINE ||
+		       opcode == VGPU_OP_WRITE_EVENT;
 	}
 	return false;
 }
 
-static struct vgpu_queue *vgpu_queue_find(struct vgpu_file *vf, u32 qid)
+/*
+ * Find a queue by id inside this fd. Not static: the graph ioctl
+ * (vgpu_sync.c) resolves the target queue the same way.
+ */
+struct vgpu_queue *vgpu_queue_find(struct vgpu_file *vf, u32 qid)
 {
 	struct vgpu_queue *q;
 
@@ -352,7 +425,7 @@ static void vgpu_queue_free(struct vgpu *v, struct vgpu_queue *q)
 	kfree(q);
 }
 
-static struct vgpu_kernel *vgpu_kernel_find(struct vgpu_file *vf, u32 kid)
+struct vgpu_kernel *vgpu_kernel_find(struct vgpu_file *vf, u32 kid)
 {
 	struct vgpu_kernel *k;
 
@@ -360,9 +433,7 @@ static struct vgpu_kernel *vgpu_kernel_find(struct vgpu_file *vf, u32 kid)
 		if (k->kid == kid)
 			return k;
 	return NULL;
-}
-
-static void vgpu_file_free_kernels(struct vgpu_file *vf)
+}static void vgpu_file_free_kernels(struct vgpu_file *vf)
 {
 	struct vgpu_kernel *k, *tmp;
 	unsigned long flags;
@@ -384,14 +455,57 @@ static void vgpu_file_free_kernels(struct vgpu_file *vf)
 	}
 }
 
+/*
+ * Is this queue still doing work? Walk the device-wide engine lists
+ * for submissions that belong to it.
+ *
+ * ring_used alone is not enough any more: a VGPU_GRAPH submission
+ * carries no ring bytes at all (the nodes came in through the ioctl,
+ * not through the queue's ring), so "ring_used == 0" would happily
+ * free a queue out from under a running graph — and the engine's
+ * bottom half writes through sub->q.
+ */
+/*
+ * Is anything from this queue in flight? MUST be called with v->lock
+ * already held — taking it here made vgpu_queue_destroy_ioctl()
+ * (which holds it) deadlock on itself, which is exactly what lockdep
+ * reported ("possible recursive locking detected").
+ */
+static bool vgpu_queue_busy_locked(struct vgpu *v, struct vgpu_queue *q)
+{
+	struct vgpu_submission *sub;
+	bool busy = false;
+	int i;
+
+	for (i = 0; i < VGPU_ENGINE_COUNT && !busy; i++)
+		list_for_each_entry(sub, &v->engine_pending[i], node)
+			if (sub->q == q) {
+				busy = true;
+				break;
+			}
+	if (!busy)
+		list_for_each_entry(sub, &v->in_flight, node)
+			if (sub->q == q)
+				busy = true;
+	return busy;
+}
+
 static void vgpu_file_destroy_all_queues(struct vgpu_file *vf)
 {
 	struct vgpu *v = vf->vf_dev;
 	struct list_head to_free = LIST_HEAD_INIT(to_free);
 	struct vgpu_queue *q, *tmp;
 	unsigned long flags;
+	int i;
 
-	/* wait for anything in flight on these queues to retire */
+	/*
+	 * Wait for anything in flight on these queues to retire. The
+	 * engines run first (a submission may still be executing, and
+	 * the bottom half writes through sub->q), then the bottom
+	 * halves.
+	 */
+	for (i = 0; i < VGPU_ENGINE_COUNT; i++)
+		flush_workqueue(v->engine_wq[i]);
 	flush_workqueue(v->irq_wq);
 
 	spin_lock_irqsave(&v->lock, flags);
@@ -792,7 +906,7 @@ static int vgpu_queue_destroy_ioctl(struct drm_device *dev, void *data,
 		spin_unlock_irqrestore(&v->lock, flags);
 		return -ENOENT;
 	}
-	if (q->ring_used) {
+	if (q->ring_used || vgpu_queue_busy_locked(v, q)) {
 		spin_unlock_irqrestore(&v->lock, flags);
 		return -EBUSY;		/* submissions still in flight */
 	}
@@ -811,95 +925,107 @@ static int vgpu_queue_destroy_ioctl(struct drm_device *dev, void *data,
 }
 
 /*
- * Resolve the BLIT's buffer handles at submit time.
+ * Resolve one BLIT: handles -> objects, pin the pages, record the
+ * range.
  *
  * Real submission drivers do the same: the ioctl context has the
  * drm_file, so it resolves handles -> objects, takes references and
  * pins the pages; the engine (workqueue context, no file) can then
  * execute without any lookup. Constraint: one BLIT per submission.
+ *
+ * Shared by the doorbell (one BLIT per submission) and by the graph
+ * ioctl (one per COPY node) - that sharing is phase G.
  */
-static int vgpu_resolve_blit(struct drm_file *file, struct vgpu_cmd *cmds,
-			     u32 ncmds, struct vgpu_submission *sub)
+int vgpu_blit_pin(struct drm_file *file, struct vgpu_blit_ref *ref,
+		  u32 src_bo, u32 dst_bo, u32 off, u32 len)
 {
-	u32 i;
+	struct drm_gem_shmem_object *src, *dst;
+	u32 npages;
 	int j;
+	int ret;
 
-	for (i = 0; i < ncmds; i++) {
-		struct vgpu_cmd *c = &cmds[i];
-		struct drm_gem_shmem_object *src, *dst;
-		u32 npages, off;
-		int ret;
+	if (ref->src_obj)
+		return -EINVAL;	/* one BLIT per submission */
 
-		if (c->opcode != VGPU_OP_BLIT)
-			continue;
-		if (sub->src_obj)
-			return -EINVAL;	/* one BLIT per submission */
+	if (off % PAGE_SIZE || len % PAGE_SIZE || len == 0 ||
+	    len > 16 * PAGE_SIZE)
+		return -EINVAL;
 
-		if (c->src_off != c->dst_off ||
-		    (c->src_off % PAGE_SIZE) ||
-		    (c->length % PAGE_SIZE) ||
-		    c->length == 0 || c->length > 16 * PAGE_SIZE)
-			return -EINVAL;
+	ref->src_obj = drm_gem_object_lookup(file, src_bo);
+	if (!ref->src_obj)
+		return -ENOENT;
+	ref->dst_obj = drm_gem_object_lookup(file, dst_bo);
+	if (!ref->dst_obj) {
+		drm_gem_object_put(ref->src_obj);
+		ref->src_obj = NULL;
+		return -ENOENT;
+	}
+	if (off + len > ref->src_obj->size || off + len > ref->dst_obj->size) {
+		ret = -ERANGE;
+		goto err_put;
+	}
 
-		sub->src_obj = drm_gem_object_lookup(file, c->src_bo);
-		if (!sub->src_obj)
-			return -ENOENT;
-		sub->dst_obj = drm_gem_object_lookup(file, c->dst_bo);
-		if (!sub->dst_obj) {
-			drm_gem_object_put(sub->src_obj);
-			sub->src_obj = NULL;
-			return -ENOENT;
-		}
-		if (c->src_off + c->length > sub->src_obj->size ||
-		    c->dst_off + c->length > sub->dst_obj->size) {
-			ret = -ERANGE;
-			goto err_put;
-		}
-
-		src = to_drm_gem_shmem_obj(sub->src_obj);
-		dst = to_drm_gem_shmem_obj(sub->dst_obj);
-		ret = drm_gem_shmem_pin(src);
-		if (ret)
-			goto err_put;
-		ret = drm_gem_shmem_pin(dst);
-		if (ret) {
-			drm_gem_shmem_unpin(src);
-			goto err_put;
-		}
-
-		off = c->src_off >> PAGE_SHIFT;
-		npages = c->length >> PAGE_SHIFT;
-		sub->nblit_pages = npages;
-		sub->blit_off = off;
-		sub->src_pages = kcalloc(npages, sizeof(*sub->src_pages),
-					 GFP_KERNEL);
-		sub->dst_pages = kcalloc(npages, sizeof(*sub->dst_pages),
-					 GFP_KERNEL);
-		if (!sub->src_pages || !sub->dst_pages) {
-			ret = -ENOMEM;
-			goto err_unpin;
-		}
-		for (j = 0; j < npages; j++) {
-			sub->src_pages[j] = src->pages[off + j];
-			sub->dst_pages[j] = dst->pages[off + j];
-			get_page(sub->src_pages[j]);
-			get_page(sub->dst_pages[j]);
-		}
-		return 0;
-
-err_unpin:
-		kfree(sub->src_pages);
-		kfree(sub->dst_pages);
-		sub->src_pages = sub->dst_pages = NULL;
-		drm_gem_shmem_unpin(dst);
+	src = to_drm_gem_shmem_obj(ref->src_obj);
+	dst = to_drm_gem_shmem_obj(ref->dst_obj);
+	ret = drm_gem_shmem_pin(src);
+	if (ret)
+		goto err_put;
+	ret = drm_gem_shmem_pin(dst);
+	if (ret) {
 		drm_gem_shmem_unpin(src);
-err_put:
-		drm_gem_object_put(sub->dst_obj);
-		drm_gem_object_put(sub->src_obj);
-		sub->src_obj = sub->dst_obj = NULL;
-		return ret;
+		goto err_put;
+	}
+
+	ref->blit_off = off >> PAGE_SHIFT;
+	npages = len >> PAGE_SHIFT;
+	ref->npages = npages;
+	ref->src_pages = kcalloc(npages, sizeof(*ref->src_pages), GFP_KERNEL);
+	ref->dst_pages = kcalloc(npages, sizeof(*ref->dst_pages), GFP_KERNEL);
+	if (!ref->src_pages || !ref->dst_pages) {
+		ret = -ENOMEM;
+		goto err_unpin;
+	}
+	for (j = 0; j < npages; j++) {
+		ref->src_pages[j] = src->pages[ref->blit_off + j];
+		ref->dst_pages[j] = dst->pages[ref->blit_off + j];
+		get_page(ref->src_pages[j]);
+		get_page(ref->dst_pages[j]);
 	}
 	return 0;
+
+err_unpin:
+	kfree(ref->src_pages);
+	kfree(ref->dst_pages);
+	ref->src_pages = ref->dst_pages = NULL;
+	ref->npages = 0;
+	drm_gem_shmem_unpin(dst);
+	drm_gem_shmem_unpin(src);
+err_put:
+	drm_gem_object_put(ref->dst_obj);
+	drm_gem_object_put(ref->src_obj);
+	ref->src_obj = ref->dst_obj = NULL;
+	return ret;
+}
+
+void vgpu_blit_unref(struct vgpu *v, struct vgpu_blit_ref *ref)
+{
+	u32 i;
+
+	if (!ref->src_obj)
+		return;
+	for (i = 0; i < ref->npages; i++) {
+		put_page(ref->src_pages[ref->blit_off + i]);
+		put_page(ref->dst_pages[ref->blit_off + i]);
+	}
+	kfree(ref->src_pages);
+	kfree(ref->dst_pages);
+	drm_gem_shmem_unpin(to_drm_gem_shmem_obj(ref->src_obj));
+	drm_gem_shmem_unpin(to_drm_gem_shmem_obj(ref->dst_obj));
+	drm_gem_object_put(ref->src_obj);
+	drm_gem_object_put(ref->dst_obj);
+	ref->src_obj = ref->dst_obj = NULL;
+	ref->src_pages = ref->dst_pages = NULL;
+	ref->npages = ref->blit_off = 0;
 }
 
 /*
@@ -1089,6 +1215,20 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 			sub->args_off = p->launch.args_off;
 			break;
 		}
+		/*
+		 * Phase G: the memory-semantics vocabulary. Validated
+		 * here, resolved (handle -> pinned object) below — the
+		 * engine must never touch a handle.
+		 */
+		case VGPU_PKT_SIGNAL_TIMELINE:
+		case VGPU_PKT_WAIT_TIMELINE:
+		case VGPU_PKT_WRITE_EVENT:
+			if (!vgpu_engine_allows(q->engine,
+						vgpu_pkt_opcode(p->type))) {
+				ret = -EINVAL;
+				goto err_unmap;
+			}
+			break;
 		default:
 			ret = -EINVAL;
 			goto err_unmap;
@@ -1097,7 +1237,6 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 
 	for (i = 0; i < sub->npkts; i++) {
 		struct vgpu_packet *p = &pk[i];
-		struct vgpu_cmd c = {};
 
 		if (p->type == VGPU_PKT_LAUNCH) {
 			/* the argument buffer: the kernel's global memory */
@@ -1124,16 +1263,36 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 		}
 		if (p->type != VGPU_PKT_COPY)
 			continue;
-		c.opcode = VGPU_OP_BLIT;
-		c.src_bo = p->copy.src_bo;
-		c.dst_bo = p->copy.dst_bo;
-		c.src_off = p->copy.off;
-		c.dst_off = p->copy.off;
-		c.length = p->copy.len;
-		ret = vgpu_resolve_blit(file, &c, 1, sub);
+		ret = vgpu_blit_pin(file, &sub->blit, p->copy.src_bo,
+				    p->copy.dst_bo, p->copy.off, p->copy.len);
 		if (ret)
 			goto err_unmap;
 	}
+
+	/*
+	 * Phase G: the semaphore page. Handles -> one pinned object per
+	 * submission (all sync packets must name the page this fd
+	 * bound, so there can only be one). Resolved here because the
+	 * engine has no fd to look handles up with.
+	 */
+	for (i = 0; i < sub->npkts; i++) {
+		struct vgpu_packet *p = &pk[i];
+
+		switch (p->type) {
+		case VGPU_PKT_SIGNAL_TIMELINE:
+		case VGPU_PKT_WAIT_TIMELINE:
+		case VGPU_PKT_WRITE_EVENT:
+			ret = vgpu_timeline_resolve(file, sub,
+						    p->timeline.sem_bo,
+						    p->timeline.sem_off);
+			if (ret)
+				goto err_unmap;
+			break;
+		default:
+			break;
+		}
+	}
+
 	kunmap_local(pk);
 
 	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
@@ -1203,8 +1362,16 @@ err_free_sub:
 	return ret;
 err_unmap:
 	kunmap_local(pk);
-	if (sub->args_obj)
+	/*
+	 * Nothing is published yet, so release what this pass pinned
+	 * (blit, semaphore page, argument buffer) right here.
+	 */
+	vgpu_blit_unref(v, &sub->blit);
+	vgpu_sync_release(v, sub);
+	if (sub->args_obj) {
+		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
 		drm_gem_object_put(sub->args_obj);
+	}
 	kfree(sub);
 	return ret;
 }
@@ -1302,17 +1469,36 @@ static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 	 * the target engine cannot decode (the alternative — feeding it
 	 * through and failing later — is how real drivers end up with
 	 * hung rings).
+	 *
+	 * The phase G sync opcodes are packet-only: the legacy 64B
+	 * command has no field that names the semaphore page, so VGPU_CS
+	 * refuses them here rather than handing the engine a NULL page.
 	 */
 	for (u32 i = 0; i < sub->ncmds; i++) {
+		if (cmds[i].opcode >= VGPU_OP_SIGNAL_TIMELINE) {
+			ret = -EINVAL;
+			goto err_rollback;
+		}
 		if (!vgpu_engine_allows(q->engine, cmds[i].opcode)) {
 			ret = -EINVAL;
 			goto err_rollback;
 		}
 	}
 
-	ret = vgpu_resolve_blit(file, cmds, sub->ncmds, sub);
-	if (ret)
-		goto err_rollback;
+	for (u32 i = 0; i < sub->ncmds; i++) {
+		struct vgpu_cmd *c = &cmds[i];
+
+		if (c->opcode != VGPU_OP_BLIT)
+			continue;
+		if (c->src_off != c->dst_off) {
+			ret = -EINVAL;
+			goto err_rollback;
+		}
+		ret = vgpu_blit_pin(file, &sub->blit, c->src_bo, c->dst_bo,
+				    c->src_off, c->length);
+		if (ret)
+			goto err_rollback;
+	}
 
 	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
 	if (!fence) {
@@ -1445,6 +1631,10 @@ static int vgpu_query_ioctl(struct drm_device *dev, void *data,
 	arg->r_seqno = v->regs->seqno;
 	arg->r_error = v->regs->error;
 	arg->r_user = v->regs->user;
+	arg->graphs = v->stats_graphs;
+	arg->signals = v->stats_signals;
+	arg->waits = v->stats_waits;
+	arg->events = v->stats_events;
 	spin_unlock_irqrestore(&v->lock, flags);
 	return 0;
 }
