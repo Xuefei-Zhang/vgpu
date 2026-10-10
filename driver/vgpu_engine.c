@@ -73,8 +73,7 @@ const struct dma_fence_ops vgpu_fence_ops = {
  * in vgpu_blit_pages, then a GPF in memcpy on the garbage page).
  */
 void vgpu_blit_pages(struct vgpu *v, struct page **src_pages,
-		     struct page **dst_pages, u32 npages)
-{
+		     struct page **dst_pages, u32 npages){
 	u32 i;
 
 	for (i = 0; i < npages; i++) {
@@ -99,11 +98,34 @@ void vgpu_blit_pages(struct vgpu *v, struct page **src_pages,
 	}
 }
 
+/*
+ * The BLIT path's one-submission wrapper: the submitter resolved the
+ * handles into page arrays (and pinned the BOs), so the engine only
+ * moves bytes. Kept as a wrapper because a graph node resolves its own
+ * buffers and calls vgpu_blit_pages() directly.
+ */
 static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
 {
 	struct vgpu_blit_ref *b = &sub->blit;
 
 	vgpu_blit_pages(v, b->src_pages, b->dst_pages, b->npages);
+}
+
+/*
+ * Phase C's DMA: GPU VA -> GPU VA. The pages were already walked out of
+ * this submission's page tables at doorbell time (that is where the fd,
+ * and therefore the VMID, is available), so the engine just moves bytes
+ * — exactly like a real one, which sees DMA addresses, not file
+ * descriptors.
+ */
+static void vgpu_vm_copy(struct vgpu *v, struct vgpu_submission *sub)
+{
+	if (!sub->vm_src_obj) {
+		sub->error = -EINVAL;
+		return;
+	}
+	vgpu_blit_pages(v, sub->vm_src_pages, sub->vm_dst_pages,
+			sub->vm_npages);
 }
 
 /*
@@ -178,6 +200,16 @@ static void vgpu_fetch_packets(struct vgpu *v, struct vgpu_submission *sub)
 			c->opcode = VGPU_OP_WRITE_EVENT;
 			c->set_off = pk[i].timeline.sem_off;
 			c->set_data = pk[i].timeline.value;
+			break;
+		case VGPU_PKT_VM_COPY:
+			/*
+			 * Phase C: the engine sees GPU addresses, not file
+			 * descriptors — the doorbell already walked them into
+			 * page arrays. All that survives the fetch is the
+			 * opcode; the pages come along in the submission.
+			 */
+			c->opcode = VGPU_OP_VM_COPY;
+			break;
 			break;
 		default:
 			c->opcode = 0xff;	/* engine reports the fault */
@@ -268,6 +300,9 @@ static enum vgpu_sched vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 		case VGPU_OP_WRITE_EVENT:
 			vgpu_sync_exec_cmd(v, sub, c->opcode, c->set_off,
 					   c->set_data);
+			break;
+		case VGPU_OP_VM_COPY:
+			vgpu_vm_copy(v, sub);
 			break;
 		}
 		default:
@@ -592,6 +627,8 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 		kfree(sub->cs);
 		sub->cs = NULL;
 	}
+	/* phase C: the VA-resolved copy's pages and buffers */
+	vgpu_vm_release_sub(sub);
 
 	mutex_lock(&v->fence_mutex);
 	fence = idr_find(&v->fence_idr, sub->seqno);

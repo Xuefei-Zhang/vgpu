@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
-/*
+/*/
  * vgpu - userspace ABI for the virtual GPU command submission driver.
  *
  * The ABI follows the modern (>= 6.1) DRM GEM conventions:
@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-/*
+/*/
  * One "GPU command". 64 bytes. The app writes commands into the
  * mmap'ed ring (see VGPU_RING_GET), then rings the doorbell
  * with VGPU_CS.
@@ -44,7 +44,7 @@ enum vgpu_opcodes {
 	VGPU_OP_BLIT	= 1,	/* DMA copy: src_bo@src_off -> dst_bo@dst_off */
 	VGPU_OP_SET	= 2,	/* write set_data into the MMIO region at set_off */
 	VGPU_OP_LAUNCH	= 3,	/* run a compute kernel (phase D: grid x block) */
-	/*
+	/*/
 	 * Phase G: the memory-semantics synchronization vocabulary. These
 	 * three operate on a *semaphore page* (see VGPU_SEM_BIND), not on
 	 * the MMIO region: the "device" writes a word the CPU can poll,
@@ -61,9 +61,17 @@ enum vgpu_opcodes {
 	VGPU_OP_SIGNAL_TIMELINE	= 4,	/* word = value */
 	VGPU_OP_WAIT_TIMELINE	= 5,	/* stall until word >= value */
 	VGPU_OP_WRITE_EVENT	= 6,	/* event slot = value */
+	/*/
+	 * Phase C: a DMA between two GPU VIRTUAL addresses. The driver
+	 * resolves both through the submitting fd's page tables, which
+	 * is the same walk a GPU's GCMC/SMMU performs — this is the
+	 * command that makes per-VMID isolation observable from
+	 * userspace.
+	 */
+	VGPU_OP_VM_COPY		= 7,
 };
 
-/*
+/*/
  * The vgpu "compute ISA" — deliberately tiny (7 instructions). Not a
  * real SASS/PTX: the point is to learn what a KERNEL LAUNCH is
  * (grid/block/warps, register file, memory ops) and what the driver
@@ -106,7 +114,7 @@ struct vgpu_module_destroy {
 	__u32 pad;
 };
 
-/*
+/*/
  * VGPU_SEM_BIND: install this fd's semaphore page (phase G).
  *
  * The app allocates a shmem BO ("VRAM"), mmaps it, and hands the driver
@@ -129,7 +137,7 @@ struct vgpu_sem_bind {
 	__u32 pad;
 };
 
-/*
+/*/
  * VGPU_GRAPH: submit a DAG of nodes with ONE doorbell (phase G).
  *
  * A node is one unit of work (COPY / LAUNCH / NOP / a timeline signal).
@@ -188,10 +196,49 @@ struct vgpu_graph_submit {
 	__u32 nnodes;		/* in, 1..VGPU_GRAPH_MAX_NODES */
 	__u32 nedges;		/* in, 0..VGPU_GRAPH_MAX_EDGES */
 	__u32 seqno;		/* out, one fence for the whole graph */
-	__u32 pad;
 };
 
 /*
+ * Phase C: the GPU virtual memory interface.
+ *
+ * Every fd is one GPU context and gets its own address space with its
+ * own VMID (a real GPU cannot describe the same VA twice — the VMID is
+ * what a memory access is tagged with). A VA range is first RESERVED
+ * (VM_ALLOC) and then a buffer is attached to it (VM_BIND); the pages
+ * become reachable to the device only through that fd's page tables.
+ *
+ *   cudaMalloc        ->  VGPU_BO_CREATE     (host-side shmem BO)
+ *   + VM_ALLOC        ->  a GPU VA in my context
+ *   + VM_BIND         ->  the device can now dereference that VA
+ *   VGPU_PKT_VM_COPY  ->  the walk happens, per page
+ *
+ * Choosing handle-vs-VA is the point: the SAME address in two processes
+ * translatesto different memory because each VMID has its own tables,
+ * and an address nobody bound is a fault, not garbage.
+ */
+struct vgpu_vm_alloc {
+	__u64 size;		/* in, bytes, rounded up to the page size */
+	__u64 align;		/* in, 0 or a power of two >= PAGE_SIZE */
+	__u64 va;		/* out, the start of the reserved range */
+	__u32 vmid;		/* out, this fd's VMID (assigned on first use) */
+	__u32 pad;
+};
+
+/* flags: bit0 = managed (UVM-lite demand migration, phase E). */
+#define VGPU_VM_BIND_MANAGED	BIT(0)
+
+struct vgpu_vm_bind {
+	__u64 va;		/* in, a VA returned by VM_ALLOC */
+	__u32 bo_handle;	/* in, the GEM handle to attach there */
+	__u32 flags;		/* in, VGPU_VM_BIND_* */
+};
+
+/* Detach the buffer at va. The VA range itself stays reserved. */
+struct vgpu_vm_unbind {
+	__u64 va;		/* in */	__u32 pad;
+};
+
+/*/
  * The device's "engines". A real GPGPU card exposes one command processor
  * per function (NVIDIA: GR + COPY + NVDEC; AMD: gfx ring + sdma + vcn);
  * a queue is an in-order stream bound to one engine, which is exactly
@@ -237,7 +284,7 @@ struct vgpu_ring_get {
 	__u64 mmap_offset;	/* out, for mmap() */
 };
 
-/*
+/*/
  * Packets: what the queue's ring actually holds once submissions
  * become packet streams (phase B). 40 bytes each, so a 4096B ring
  * holds 102 of them. Note the three sizes that are easy to confuse:
@@ -251,7 +298,7 @@ enum vgpu_packet_type {
 	VGPU_PKT_COPY		= 1,	/* BO->BO DMA */
 	VGPU_PKT_WRITE_REG	= 2,	/* write into the MMIO region */
 	VGPU_PKT_LAUNCH		= 3,	/* run a compute kernel */
-	/*
+	/*/
 	 * Phase G: memory-semantics sync. All three name a word in the
 	 * semaphore page bound by VGPU_SEM_BIND. Word 0 of that page is
 	 * conventionally the timeline value; any other word can serve as
@@ -262,6 +309,13 @@ enum vgpu_packet_type {
 	VGPU_PKT_SIGNAL_TIMELINE	= 4,
 	VGPU_PKT_WAIT_TIMELINE		= 5,
 	VGPU_PKT_WRITE_EVENT		= 6,
+	/*
+	 * Phase C: a DMA between two GPU virtual addresses. Unlike the
+	 * COPY packet (BO handles), both endpoints are VAs in the
+	 * submitting fd's address space, which is what makes per-VMID
+	 * isolation observable: the driver walks THAT fd's tables.
+	 */
+	VGPU_PKT_VM_COPY		= 7,
 };
 
 struct vgpu_packet {
@@ -278,10 +332,14 @@ struct vgpu_packet {
 			__u32 pad;
 			__u64 reg_val;	/* value */
 		} reg;
-		/*
+		/*/
 		 * LAUNCH: the kernel descriptor a GPGPU driver receives
 		 * for every kernel launch (grid/block dims, the argument
-		 * buffer, the kernel to run).
+		 * buffer, the kernel to run). The argument buffer is
+		 * named by a GEM handle: it is a pool buffer, and the
+		 * phase-C way to address one by GPU VA is VM_BIND +
+		 * VGPU_PKT_VM_COPY, which is the path that has to go
+		 * through the submitter's page tables.
 		 */
 		struct {
 			__u32 kid;	/* kernel id (VGPU_MODULE_LOAD) */
@@ -291,7 +349,7 @@ struct vgpu_packet {
 			__u32 args_off;	/* byte offset of the args inside it */
 			__u32 pad[3];
 		} launch;
-		/*
+		/*/
 		 * Phase G sync operands: which word of the bound
 		 * semaphore page, and the value. The handle is carried
 		 * per packet (that is what a GPU VA / semaphore address
@@ -304,7 +362,18 @@ struct vgpu_packet {
 			__u32 pad;
 			__u64 value;	/* written (SIGNAL/EVENT) or awaited */
 		} timeline;
-	};
+
+/*/
+* Phase C: VA -> VA DMA. Both addresses are GPU virtual
+		 * addresses in the submitting fd's address space; the
+		 * driver walks that fd's page tables to find the pages.
+		 */
+		struct {
+			__u64 src_va;	/* page-aligned source VA */
+			__u64 dst_va;	/* page-aligned destination VA */
+			__u32 len;	/* bytes, page aligned, <= 256K */
+			__u32 pad[3];
+		} vm_copy;	};
 };
 
 /* VGPU_DOORBELL: "the writer has produced packets up to put". */
@@ -363,6 +432,13 @@ struct vgpu_query {
 #define DRM_VGPU_SEM_BIND	0x0b
 #define DRM_VGPU_GRAPH		0x0c
 
+#define DRM_VGPU_VM_ALLOC	0x0d
+#define DRM_VGPU_VM_BIND	0x0e
+#define DRM_VGPU_VM_UNBIND	0x0f
+
+#define DRM_IOCTL_VGPU_VM_ALLOC		DRM_IOWR(VGPU_IOC(DRM_VGPU_VM_ALLOC), struct vgpu_vm_alloc)
+#define DRM_IOCTL_VGPU_VM_BIND		DRM_IOWR(VGPU_IOC(DRM_VGPU_VM_BIND), struct vgpu_vm_bind)
+#define DRM_IOCTL_VGPU_VM_UNBIND	DRM_IOWR(VGPU_IOC(DRM_VGPU_VM_UNBIND), struct vgpu_vm_unbind)
 #define DRM_IOCTL_VGPU_BO_CREATE	DRM_IOWR(VGPU_IOC(DRM_VGPU_BO_CREATE), struct vgpu_bo_create)
 #define DRM_IOCTL_VGPU_RING_GET		DRM_IOWR(VGPU_IOC(DRM_VGPU_RING_GET), struct vgpu_ring_get)
 #define DRM_IOCTL_VGPU_CS		DRM_IOWR(VGPU_IOC(DRM_VGPU_CS), struct vgpu_cs)

@@ -118,7 +118,10 @@ echo "=== phase G: memory-semantics sync (timeline semaphore, graph) ==="
 /root/vgpu_test -g || exit 1
 echo "--- sync stats (graphs / signals / waits / events) ---"
 cat /sys/kernel/debug/vgpu/sync
-echo "=== ftrace: function_graph over vgpu_* ==="
+echo "=== phase C: GPU virtual memory (VMID isolation + VRAM budget) ==="
+/root/vgpu_test -v || exit 1
+echo "--- vm view: per-context VA ranges, budget, evictions ---"
+cat /sys/kernel/debug/vgpu/vmecho "=== ftrace: function_graph over vgpu_* ==="
 TR=/sys/kernel/debug/tracing
 echo function_graph > "$TR/current_tracer"
 echo 'vgpu_*' > "$TR/set_ftrace_filter"

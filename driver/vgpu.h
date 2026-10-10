@@ -16,6 +16,7 @@
 #include <linux/highmem.h>
 #include <linux/idr.h>
 #include <linux/platform_device.h>
+#include <linux/seq_file.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 
@@ -209,7 +210,18 @@ struct vgpu_submission {
 	 * before the launch has written its output).
 	 */
 	u32 gnode_idx;
-};
+
+	/*
+	 * Phase C: a DMA between GPU virtual addresses. Resolved at
+	 * submit time, exactly like the BLIT above: the doorbell is the
+	 * only place that has the drm_file (and therefore the VMID), so
+	 * the page-table walk happens here rather than in the engine.
+	 * The submission owns its own object + page references, which is
+	 * what makes an unbind/eviction racing the engine harmless.
+	 */
+	struct drm_gem_object *vm_src_obj, *vm_dst_obj;
+	struct page **vm_src_pages, **vm_dst_pages;
+	u32 vm_npages;};
 
 /*
  * A submission queue: one in-order command stream bound to one engine.
@@ -272,12 +284,87 @@ struct vgpu_kernel {
 	struct vgpu_instr *code;	/* driver-side copy, ninstr entries */
 };
 
+/* ------------------------------------------------- phase C: the VM */
+
+/*
+ * Page-table geometry. Two levels, both kernel pages:
+ *
+ *   PDE page : 1024 x u32 entries, each the PFN of a PTE page.
+ *              (va >> 22) selects the entry -> a PTE page covers 4M.
+ *   PTE page : 1024 x u32 entries, each the PFN of a data page.
+ *              (va >> 12) selects the entry.
+ *
+ * So the driver performs exactly the walk a GPU's GCMC (or an SMMU)
+ * performs, and the reason a multi-page buffer needs a page table at
+ * all is visible: the second level is per 4M of VA and is allocated
+ * lazily, so a context that has bound one page still costs one page.
+ */
+#define VGPU_VM_PDE_ENTRIES	(PAGE_SIZE / sizeof(u32))
+#define VGPU_VM_PTE_ENTRIES	(PAGE_SIZE / sizeof(u32))
+#define VGPU_VM_PDE_SHIFT	(PAGE_SHIFT + 10)	/* 22 */
+#define VGPU_VM_PDE_IDX(va)	(((va) >> VGPU_VM_PDE_SHIFT) & \
+				 (VGPU_VM_PDE_ENTRIES - 1))
+#define VGPU_VM_PTE_IDX(va)	(((va) >> PAGE_SHIFT) & \
+				 (VGPU_VM_PTE_ENTRIES - 1))
+
+#define VGPU_PTE_VALID		BIT(31)
+#define VGPU_PTE_PFN_MASK	0x3fffffffu
+#define VGPU_PDE_VALID		BIT(31)
+#define VGPU_PDE_PFN_MASK	0x3fffffffu
+
+/* The VA space handed out: 32-bit, and page 0 is never a target. */
+#define VGPU_VM_VA_BASE		((u64)PAGE_SIZE)
+#define VGPU_VM_VA_END		(1ULL << 32)
+
+#define VGPU_VMID_MIN		1
+#define VGPU_VMID_MAX		65535
+
+/* The device's "VRAM" budget: a TTM-lite LRU, not a real allocator. */
+#define VGPU_VM_VRAM_BUDGET	(16ULL * 1024 * 1024)
+#define VGPU_VM_MAX_COPY_PAGES	64		/* 256K per VA copy */
+
+/*
+ * One buffer mapped into a VM: the driver-side record of "bo#N is at
+ * VA X in context Y". This is the VRAM manager's unit of residency
+ * and eviction — mapped == the PTEs are installed right now.
+ */
+struct vgpu_vm_range {
+	struct list_head node;		/* vm->ranges, address order */
+	struct list_head lru_node;	/* v->vram_lru, MRU at the tail */
+	u64 start;			/* VA, page aligned */
+	u64 size;			/* bytes */
+	struct vgpu_vm *vm;		/* owner: whose tables hold the PTEs */
+	struct drm_gem_object *obj;	/* our reference (a handle's is its own) */
+	u32 handle;			/* the fd handle it was bound with */
+	bool mapped;			/* resident: PTEs installed */
+};
+
+/*
+ * A per-fd GPU address space. This IS the GPU context's VM: one VMID
+ * per fd, its own page tables, its own reserved VA ranges. The point
+ * of the phase is that the same VA in two of these means different
+ * memory, and the VMID is the tag a real memory access carries to say
+ * which tables to walk.
+ */
+struct vgpu_vm {
+	struct list_head node;		/* v->vm_list */
+	struct list_head ranges;	/* struct vgpu_vm_range, address order */
+	struct vgpu *v;
+	struct vgpu_file *file;		/* the owning fd */
+	u32 vmid;
+	struct page *pde;		/* level-1 table: 1024 PTE pages */
+	u64 resident;			/* bytes currently mapped in this VM */
+	u32 nranges;
+};
+
 /* Per-fd state: every open() owns its queues (drm_file.driver_priv). */
 struct vgpu_file {
 	struct list_head queues;	/* struct vgpu_queue */
 	struct list_head kernels;	/* struct vgpu_kernel */
 	struct vgpu_queue *default_q;	/* lazily created GFX queue (qid 0) */
+	struct vgpu_vm *vm;		/* phase C: this fd's GPU address space */
 	struct vgpu *vf_dev;
+	struct drm_file *drm_file;	/* for handle -> object lookups */
 	u32 next_qid;
 	u32 next_kid;
 	/*
@@ -344,6 +431,30 @@ struct vgpu {
 	/* phase G: memory-semantics synchronization counters */
 	u64 stats_graphs, stats_signals, stats_waits, stats_events;
 
+	/*
+	 * Phase C: the "VRAM" manager. A device-wide byte budget with an
+	 * LRU: a bind that does not fit evicts the least recently used
+	 * mapping (unwind its PTEs, keep the shmem pages — the BO does
+	 * not move, host memory IS its backing) and a later access maps
+	 * it straight back. That is TTM's eviction model with CPU swap
+	 * as the destination, and it is deliberately NOT a buddy
+	 * allocator (docs/GPGPU-EVOLUTION-PLAN.md §6).
+	 *
+	 * A mutex and not a spinlock, unlike the other locks here:
+	 * walking the tables can allocate a PTE page, and the fix for the
+	 * sleeping-in-spinlock bug in this repo's history is to not be in
+	 * one. No engine context ever touches these tables — the engine
+	 * runs on pages the submitter already resolved.
+	 */
+	struct mutex vm_lock;
+	struct list_head vm_list;	/* every live struct vgpu_vm */
+	struct list_head vram_lru;	/* mapped ranges, MRU at the tail */
+	struct ida vm_ida;		/* VMID allocation */
+	u64 vram_budget, vram_resident;
+	u64 stats_evicted;		/* ranges unwound to the host */
+	u64 stats_vm_faults;		/* VAs resolved through a demand re-map */
+	u64 stats_remap_pages;		/* pages re-installed by those faults */
+	u64 stats_bound;		/* ranges bound since boot */
 	/* compute statistics (debugfs "compute") */
 	u64 cs_kernels_launched, cs_blocks, cs_warps, cs_threads;
 	u64 cs_instrs, cs_mem_ops, cs_waves;
@@ -371,6 +482,32 @@ struct vgpu {
 /* word-addressed access into a pinned BO (vgpu_sync.c, vgpu_compute.c) */
 #define VGPU_WORDS_PER_PAGE	(PAGE_SIZE / sizeof(u32))
 
+/*
+ * vgpu_vm.c — phase C: per-fd GPU address space, the two-level
+ * software page table walk, and the VRAM budget/LRU eviction.
+ * All of it runs with v->vm_lock held (a mutex: the walk allocates).
+ */
+struct vgpu_vm *vgpu_vm_get(struct vgpu_file *vf);
+void vgpu_vm_destroy(struct vgpu_file *vf);
+/* This fd's VMID, or 0 if it has no address space yet. */
+u32 vgpu_vm_vmid(struct vgpu_file *vf);
+int vgpu_vm_alloc(struct vgpu_file *vf, u64 size, u64 align, u64 *va_out);
+int vgpu_vm_bind(struct vgpu_file *vf, u64 va, u32 handle, u32 flags);
+void vgpu_vm_unbind(struct vgpu_file *vf, u64 va);
+/*
+ * Resolve npages of GPU VA in this fd. On success the caller owns the
+ * returned object reference and one reference on each page — the same
+ * "pin at submit" rule the BLIT path follows, which is what keeps a
+ * concurrent unbind or eviction from pulling the pages away.
+ */
+int vgpu_vm_resolve(struct vgpu_file *vf, u64 va, u32 npages,
+		    struct drm_gem_object **objp, struct page **pages);
+void vgpu_vm_release(struct drm_gem_object *obj, struct page **pages,
+		     u32 npages);
+void vgpu_vm_release_sub(struct vgpu_submission *sub);
+void vgpu_vm_evict_all(struct vgpu *v);
+int vgpu_vm_show(struct seq_file *s, void *data);
+void vgpu_vm_destroy_all(struct vgpu *v);
 /* vgpu_compute.c */
 struct vgpu_instr;
 enum vgpu_sched vgpu_compute_run(struct vgpu *v, struct vgpu_submission *sub);

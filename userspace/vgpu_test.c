@@ -24,6 +24,10 @@
  *        no VGPU_WAIT anywhere in that path — and a 4-node graph
  *        (copy -> launch -> copy -> signal) is submitted with ONE
  *        doorbell and measured against 4 separate doorbells.
+ * -v:   phase C: GPU virtual memory. Two processes bind DIFFERENT
+ *        BOs to the SAME virtual address and each reads back its own
+ *        data (VMID isolation); binding past the VRAM budget evicts
+ *        and demand-faults transparently.
  * -f:   phase F: timeslicing (two contexts on the compute engine must
  *        interleave) and preemption (a prio=2 launch submitted while a
  *        prio=0 one runs must pause it), with both results correct.
@@ -47,6 +51,17 @@
 #define BO_SIZE (64 * 1024)
 #define BLIT_LEN 4096
 #define USER_MAGIC 0xdeadbeefu
+
+static int open_dev(void)
+{
+	int fd = open("/dev/dri/renderD128", O_RDWR);
+
+	if (fd < 0)
+		fd = open("/dev/dri/card0", O_RDWR);
+	if (fd < 0)
+		fprintf(stderr, "FAIL: open /dev/dri/*: %s\n", strerror(errno));
+	return fd;
+}
 
 static int check(int fd, void *arg, unsigned long nr, const char *what)
 {
@@ -1678,6 +1693,463 @@ out:
 	return rc;
 }
 
+
+/* ---------------------------------------------- phase C: GPU virtual memory */
+
+/*
+ * Phase C is the memory model of a GPGPU card observed from userspace:
+ *
+ *   cudaMalloc            -> VGPU_BO_CREATE   (a pool buffer)
+ *   + VM_ALLOC            -> a GPU VA in MY context
+ *   + VM_BIND             -> the device can dereference that VA
+ *   VGPU_PKT_VM_COPY      -> the driver walks MY page tables
+ *
+ * Every fd is one context with its own VMID, so "the same address"
+ * means nothing until you say whose tables to walk. That is the whole
+ * point, and it is what this mode demonstrates:
+ *
+ *  (a) two contexts reserve the SAME VA (0x10000, by asking for the
+ *      same alignment) and bind DIFFERENT buffers there. A VA->VA DMA
+ *      through each context's doorbell brings back its own pattern.
+ *      A third context that reserved the VA but never bound it faults
+ *      with -ENOENT: an address nobody bound is a fault, not garbage.
+ *
+ *  (b) binding more than the device's VRAM budget evicts; the evicted
+ *      ranges still read back correctly, because a fault re-maps them
+ *      (demand paging — the TTM model, with host memory as the
+ *      destination the pages never actually leave).
+ */
+#define VM_RANGE	(64 * 1024)	/* the range each context reserves */
+#define VM_ALIGN	0x10000		/* ... at this alignment, so both */
+#define VM_WANT_VA	0x10000		/* ... contexts get this VA */
+#define VM_2ND_VA	0x20000		/* first-fit then hands this out */
+#define VM_COPY_LEN	4096		/* one page of VA->VA DMA */
+#define VM_EVICT_N	4		/* 4 x 64K against a 128K budget */
+#define VM_EVICT_BUDGET	(128 * 1024)
+#define VM_DBG		"/sys/kernel/debug/vgpu/vm"
+
+struct vm_ctx {
+	int fd;
+	uint8_t *ring;
+	uint32_t qid;
+	uint32_t ring_put;	/* how far this fd's writer has produced */
+	uint32_t src_bo, dst_bo;
+	uint8_t *src, *dst;
+	uint64_t src_va, dst_va;
+	uint32_t vmid;
+};
+
+/* what a context reports back (through shared memory, it is forked) */
+struct vm_report {
+	uint32_t vmid;
+	int rc;
+};
+
+static int vm_bo(struct vm_ctx *c, uint32_t *handle, uint8_t **map)
+{
+	struct vgpu_bo_create bo = {};
+
+	bo.size = VM_RANGE;
+	if (check(c->fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "vm bo_create"))
+		return -1;
+	*handle = bo.handle;
+	if (map)
+		*map = xmap(c->fd, bo.mmap_offset, VM_RANGE);
+	return 0;
+}
+
+static int vm_alloc(struct vm_ctx *c, uint64_t align, uint64_t *va)
+{
+	struct vgpu_vm_alloc a = {};
+
+	a.size = VM_RANGE;
+	a.align = align;
+	if (check(c->fd, &a, DRM_IOCTL_VGPU_VM_ALLOC, "vm_alloc"))
+		return -1;
+	c->vmid = a.vmid;	/* assigned on first use, kept afterwards */
+	*va = a.va;
+	return 0;
+}
+
+static int vm_bind(struct vm_ctx *c, uint64_t va, uint32_t handle)
+{
+	struct vgpu_vm_bind b = {};
+
+	b.va = va;
+	b.bo_handle = handle;
+	return check(c->fd, &b, DRM_IOCTL_VGPU_VM_BIND, "vm_bind");
+}
+
+/* one stream on the DMA engine: a VA->VA copy is that engine's job */
+static int vm_queue(struct vm_ctx *c)
+{
+	struct vgpu_queue_create qc = {};
+
+	qc.engine = VGPU_ENGINE_COPY;
+	qc.prio = 1;
+	qc.nslots = 16;
+	if (check(c->fd, &qc, DRM_IOCTL_VGPU_QUEUE_CREATE, "queue_create"))
+		return -1;
+	c->qid = qc.qid;
+	c->ring = xmap(c->fd, qc.mmap_offset, qc.ring_size);
+	return 0;
+}
+
+/*
+ * A VA->VA DMA through the doorbell. Returns 0, or a negative errno:
+ * the doorbell itself resolves both addresses against THIS fd's page
+ * tables, so an address this context never bound fails here.
+ */
+static int vm_copy(struct vm_ctx *c, uint64_t src, uint64_t dst)
+{
+	struct vgpu_packet *pk;
+	struct vgpu_doorbell db = {};
+	struct vgpu_wait w = {};
+
+	/*
+	 * Append to the queue ring, don't rewrite it: the engine advances
+	 * get as it consumes, so the next doorbell must name a put past
+	 * that (the same rule the phase-B batch-2 test relies on).
+	 */
+	if (c->ring_put + sizeof(*pk) > 16 * 64) {
+		fprintf(stderr, "FAIL: va ring full\n");
+		return -ENOMEM;
+	}
+	pk = (struct vgpu_packet *)(c->ring + c->ring_put);
+	memset(pk, 0, sizeof(*pk));
+	pk[0].type = VGPU_PKT_VM_COPY;
+	pk[0].vm_copy.src_va = src;
+	pk[0].vm_copy.dst_va = dst;
+	pk[0].vm_copy.len = VM_COPY_LEN;
+
+	db.qid = c->qid;
+	db.put = c->ring_put + sizeof(*pk);
+	if (ioctl(c->fd, DRM_IOCTL_VGPU_DOORBELL, &db) < 0)
+		return -errno;
+	c->ring_put = db.put;
+
+	w.seqno = db.seqno;
+	w.timeout_ms = 5000;
+	if (check(c->fd, &w, DRM_IOCTL_VGPU_WAIT, "vm wait"))
+		return -1;
+	if (w.status != 0) {
+		fprintf(stderr, "FAIL: va copy status=%d\n", (int)w.status);
+		return w.status ? w.status : -1;
+	}
+	return 0;
+}
+
+/* One counter off the driver's "device:" line in the vm view. */
+static long long vm_dev_num(const char *buf, const char *key)
+{
+	const char *line, *p;
+	char *end;
+	long long v;
+
+	line = strstr(buf, "device:");
+	if (!line)
+		return -1;
+	p = strstr(line, key);
+	if (!p)
+		return -1;
+	p += strlen(key);
+	while (*p == ' ' || *p == '\t')
+		p++;
+	v = strtoll(p, &end, 10);
+	return end == p ? -1 : v;
+}
+
+static int vm_dbg_read(char *buf, size_t len)
+{
+	FILE *f = fopen(VM_DBG, "r");
+	size_t n;
+
+	if (!f)
+		return -1;
+	n = fread(buf, 1, len - 1, f);
+	buf[n] = '\0';
+	fclose(f);
+	return 0;
+}
+
+/* the vm view is writable: a new budget applies immediately */
+static int vm_dbg_write(uint64_t budget)
+{
+	FILE *f = fopen(VM_DBG, "w");
+
+	if (!f)
+		return -1;
+	if (fprintf(f, "%llu\n", (unsigned long long)budget) < 0) {
+		fclose(f);
+		return -1;
+	}
+	return fclose(f) ? -1 : 0;
+}
+
+/*
+ * Acceptance (a): one context's copy of the shared VA. @seed is the
+ * pattern only this context's buffer holds.
+ */
+static int vm_isolation_child(uint8_t seed, struct vm_report *rep)
+{
+	struct vm_ctx c = {};
+	int rc = 1, i;
+
+	c.fd = open_dev();
+	if (c.fd < 0)
+		return 1;
+
+	if (vm_bo(&c, &c.src_bo, &c.src) ||
+	    vm_bo(&c, &c.dst_bo, &c.dst) ||
+	    vm_alloc(&c, VM_ALIGN, &c.src_va) ||
+	    vm_alloc(&c, 0, &c.dst_va) ||
+	    vm_bind(&c, c.src_va, c.src_bo) ||
+	    vm_bind(&c, c.dst_va, c.dst_bo) ||
+	    vm_queue(&c))
+		goto out;
+
+	if (c.src_va != VM_WANT_VA || c.dst_va != VM_2ND_VA) {
+		fprintf(stderr, "FAIL: va 0x%llx/0x%llx, want 0x%x/0x%x\n",
+			(unsigned long long)c.src_va,
+			(unsigned long long)c.dst_va,
+			VM_WANT_VA, VM_2ND_VA);
+		goto out;
+	}
+
+	for (i = 0; i < VM_COPY_LEN; i++)
+		c.src[i] = (uint8_t)(seed + (i & 0x0f));
+	memset(c.dst, 0, VM_RANGE);
+
+	if (vm_copy(&c, c.src_va, c.dst_va))
+		goto out;
+	for (i = 0; i < VM_COPY_LEN; i++) {
+		if (c.dst[i] != c.src[i]) {
+			fprintf(stderr,
+				"FAIL: vmid %u va 0x%llx read 0x%02x, own pattern is 0x%02x\n",
+				c.vmid, (unsigned long long)c.src_va,
+				c.dst[i], c.src[i]);
+			goto out;
+		}
+	}
+	printf("[pid %d] PASS: vmid %u: va 0x%llx is MY buffer "
+	       "(pattern 0x%02x.., DMA'd to va 0x%llx and read back)\n",
+	       (int)getpid(), c.vmid, (unsigned long long)c.src_va, seed,
+	       (unsigned long long)c.dst_va);
+	rep->vmid = c.vmid;
+	rep->rc = 0;
+	rc = 0;
+
+out:
+	close(c.fd);
+	return rc;
+}
+
+/*
+ * Acceptance (a), the other half: a context that reserved the very same
+ * VA and never attached a buffer to it must fault, not read the other
+ * context's bytes.
+ */
+static int vm_unbound(uint32_t *vmid_out)
+{
+	struct vm_ctx c = {};
+	uint64_t va;
+	int rc = 1;
+
+	c.fd = open_dev();
+	if (c.fd < 0)
+		return 1;
+
+	if (vm_alloc(&c, VM_ALIGN, &va) || vm_queue(&c))
+		goto out;
+	if (va != VM_WANT_VA) {
+		fprintf(stderr, "FAIL: va 0x%llx, want 0x%x\n",
+			(unsigned long long)va, VM_WANT_VA);
+		goto out;
+	}
+	*vmid_out = c.vmid;
+
+	rc = vm_copy(&c, va, VM_2ND_VA);
+	if (rc != -ENOENT) {
+		fprintf(stderr,
+			"FAIL: unbound va 0x%llx returned %d, want -ENOENT\n",
+			(unsigned long long)va, rc);
+		rc = 1;
+		goto out;
+	}
+	printf("[pid %d] PASS: vmid %u: va 0x%llx reserved but never bound "
+	       "-> -ENOENT (a fault, not another context's data)\n",
+	       (int)getpid(), c.vmid, (unsigned long long)va);
+	rc = 0;
+
+out:
+	close(c.fd);
+	return rc;
+}
+
+/* Acceptance (b): bind past the budget, then read everything back. */
+static int vm_eviction(void)
+{
+	struct vm_ctx c = {};
+	uint8_t *map[VM_EVICT_N];
+	uint32_t handle[VM_EVICT_N];
+	uint64_t va[VM_EVICT_N], scratch, budget = 0;
+	char dbg[8192];
+	long long b, evicted, faults;
+	int rc = 1, i, j;
+
+	c.fd = open_dev();
+	if (c.fd < 0)
+		return 1;
+
+	if (vm_dbg_read(dbg, sizeof(dbg))) {
+		fprintf(stderr, "FAIL: read %s: %s\n", VM_DBG, strerror(errno));
+		goto out;
+	}
+	b = vm_dev_num(dbg, "budget ");
+	if (b < 0) {
+		fprintf(stderr, "FAIL: no budget in %s\n", VM_DBG);
+		goto out;
+	}
+	budget = (uint64_t)b;
+	printf("[pid %d] device VRAM budget is %llu B; forcing %d B\n",
+	       (int)getpid(), (unsigned long long)budget, VM_EVICT_BUDGET);
+	if (vm_dbg_write(VM_EVICT_BUDGET)) {
+		fprintf(stderr, "FAIL: write %s: %s\n", VM_DBG, strerror(errno));
+		goto out;
+	}
+
+	for (i = 0; i < VM_EVICT_N; i++) {
+		if (vm_bo(&c, &handle[i], &map[i]))
+			goto out;
+		/* a distinct pattern per buffer: a wrong mapping shows up */
+		memset(map[i], 0xC0 + i, VM_RANGE);
+		if (vm_alloc(&c, 0, &va[i]) || vm_bind(&c, va[i], handle[i]))
+			goto out;
+	}
+
+	/* the buffer the ranges are read back through */
+	if (vm_bo(&c, &c.dst_bo, &c.dst) ||
+	    vm_alloc(&c, 0, &scratch) ||
+	    vm_bind(&c, scratch, c.dst_bo) ||
+	    vm_queue(&c))
+		goto out;
+
+	if (vm_dbg_read(dbg, sizeof(dbg))) {
+		fprintf(stderr, "FAIL: read %s: %s\n", VM_DBG, strerror(errno));
+		goto out;
+	}
+	printf("--- debugfs: %s (budget forced to %d B) ---\n%s",
+	       VM_DBG, VM_EVICT_BUDGET, dbg);
+	evicted = vm_dev_num(dbg, "evicted ");
+	if (evicted <= 0) {
+		fprintf(stderr, "FAIL: evicted=%lld, expected > 0\n", evicted);
+		goto out;
+	}
+	printf("PASS: %lld range(s) evicted (%d B of bindings past a %d B budget)\n",
+	       evicted, VM_EVICT_N * VM_RANGE, VM_EVICT_BUDGET);
+
+	/*
+	 * Read every range back. The resident ones answer from their PTEs;
+	 * the evicted ones fault on the way in and are mapped back — which
+	 * is why the data is correct either way.
+	 */
+	for (i = 0; i < VM_EVICT_N; i++) {
+		memset(c.dst, 0, VM_RANGE);
+		if (vm_copy(&c, va[i], scratch))
+			goto out;
+		for (j = 0; j < VM_COPY_LEN; j++) {
+			if (c.dst[j] != (uint8_t)(0xC0 + i)) {
+				fprintf(stderr,
+					"FAIL: va 0x%llx read 0x%02x, want 0x%02x\n",
+					(unsigned long long)va[i], c.dst[j],
+					0xC0 + i);
+				goto out;
+			}
+		}
+		printf("[pid %d] PASS: va 0x%llx read its own pattern 0x%02x.. after eviction\n",
+		       (int)getpid(), (unsigned long long)va[i], 0xC0 + i);
+	}
+
+	if (vm_dbg_read(dbg, sizeof(dbg))) {
+		fprintf(stderr, "FAIL: read %s: %s\n", VM_DBG, strerror(errno));
+		goto out;
+	}
+	faults = vm_dev_num(dbg, "demand-faults ");
+	if (faults <= 0) {
+		fprintf(stderr, "FAIL: demand-faults=%lld, expected > 0\n",
+			faults);
+		goto out;
+	}
+	printf("PASS: %lld demand fault(s) serviced by re-mapping "
+	       "(eviction is transparent to the reader)\n", faults);
+	rc = 0;
+
+out:
+	/* leave the device the way we found it */
+	if (budget > 0)
+		vm_dbg_write(budget);
+	close(c.fd);
+	return rc;
+}
+
+static int run_vm(void)
+{
+	struct vm_report *sh;
+	pid_t pids[2];
+	int i, failed = 0;
+	uint32_t vmid = 0;
+
+	printf("=== phase C: VMID isolation — one VA, two contexts, two buffers ===\n");
+
+	/* shared memory: the forked contexts report their VMID back */
+	sh = mmap(NULL, sizeof(*sh) * 2, PROT_READ | PROT_WRITE,
+		  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (sh == MAP_FAILED) {
+		fprintf(stderr, "FAIL: mmap: %s\n", strerror(errno));
+		return 1;
+	}
+
+	for (i = 0; i < 2; i++) {
+		pids[i] = fork();
+		if (pids[i] < 0) {
+			fprintf(stderr, "FAIL: fork: %s\n", strerror(errno));
+			return 1;
+		}
+		if (!pids[i])
+			_exit(vm_isolation_child(i ? 0xB0 : 0xA0, &sh[i]));
+	}
+	for (i = 0; i < 2; i++) {
+		int st;
+
+		waitpid(pids[i], &st, 0);
+		if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+			fprintf(stderr, "child %d (pid %d) FAILED\n", i,
+				(int)pids[i]);
+			failed++;
+		}
+	}
+
+	if (failed)
+		return 1;
+	if (sh[0].vmid == sh[1].vmid) {
+		fprintf(stderr, "FAIL: both contexts got vmid %u\n", sh[0].vmid);
+		return 1;
+	}
+	printf("PASS: VMID isolation: vmid %u and vmid %u both hold va 0x%x, "
+	       "each mapping its own buffer\n", sh[0].vmid, sh[1].vmid,
+	       VM_WANT_VA);
+
+	if (vm_unbound(&vmid))
+		return 1;
+
+	printf("=== phase C: VRAM budget — bind past it, evict, read back ===\n");
+	if (vm_eviction())
+		return 1;
+
+	printf("phase C: VMID isolation, budget eviction and demand re-map all pass\n");
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int m = 1, i;
@@ -1696,6 +2168,9 @@ int main(int argc, char **argv)
 
 	if (argc > 1 && !strcmp(argv[1], "-g"))
 		return run_sync() ? 1 : 0;
+
+	if (argc > 1 && !strcmp(argv[1], "-v"))
+		return run_vm() ? 1 : 0;
 
 	if (argc > 1 && !strcmp(argv[1], "-f"))
 		return run_preempt() ? 1 : 0;
