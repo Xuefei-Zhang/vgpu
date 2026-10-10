@@ -41,6 +41,10 @@ echo "--- compute stats ---"
 cat /sys/kernel/debug/vgpu/compute
 echo "=== negative paths (bad handle / engine fault / ring full) ==="
 /root/vgpu_test -e || exit 1
+echo "=== phase G: memory-semantics sync (timeline semaphore, graph) ==="
+/root/vgpu_test -g || exit 1
+echo "--- sync stats (graphs / signals / waits / events) ---"
+cat /sys/kernel/debug/vgpu/sync
 echo "=== ftrace: function_graph over vgpu_* ==="
 TR=/sys/kernel/debug/tracing
 echo function_graph > "$TR/current_tracer"

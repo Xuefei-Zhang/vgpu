@@ -693,9 +693,687 @@ out:
 	return rc;
 }
 
+/* ------------------------------------------- phase G: memory-semantics sync */
+
+/*
+ * Phase G: completion as MEMORY, not as a syscall.
+ *
+ * Everywhere else in this driver the app asks "is it done?" with
+ * VGPU_WAIT and the kernel blocks on its behalf in
+ * dma_fence_wait_timeout(). Modern GPU APIs do the opposite: the
+ * completion lives in a word of memory both sides can see — a Vulkan
+ * timeline semaphore, a CUDA graph's completion flag, the sync-object
+ * pages every real driver puts in its submission ring — and the CPU
+ * simply polls it. This mode is that:
+ *
+ *   A.  VGPU_SEM_BIND installs a BO as this fd's semaphore page. A
+ *       batch whose LAST packet is SIGNAL_TIMELINE writes the timeline
+ *       value into it, and we discover completion by reading the
+ *       mmap'ed BO. There is NO VGPU_WAIT anywhere in this mode.
+ *   A2. A WAIT_TIMELINE packet on the COPY engine stalls the ENGINE
+ *       until the GFX engine writes the value: the cross-engine
+ *       dependency is one word of shared memory. We poll for the copy
+ *       engine's event slot, so the CPU never blocks either.
+ *   B.  A 4-node DAG (copy-in -> launch -> copy-out -> signal)
+ *       submitted with ONE VGPU_GRAPH ioctl: one syscall, one
+ *       doorbell, one fence for all four nodes.
+ *   B2. The same four units of work as FOUR separate doorbells, with
+ *       VGPU_QUERY's submission counters as the measurement.
+ *
+ * The graph's node indices are deliberately NOT the dependency order:
+ * index 1 (the copy-out) depends on index 2 (the launch). The only
+ * assertion available from userspace is the DATA dependency — if the
+ * driver ran the nodes in index order, the copy-out would move the
+ * pre-launch poison instead of the kernel's output, and the checks
+ * below would fail. (dmesg also prints the resolved order; the driver
+ * logs no per-node start, so the data path is the real proof.)
+ */
+#define SEM_BO_WORDS	1024		/* the semaphore page: one page */
+#define SEM_W_TIMELINE	0		/* word 0: the timeline value */
+#define SEM_W_EVENT_A	1		/* word 1: an event slot */
+#define SEM_W_EVENT_B	2		/* word 2: another event slot */
+#define SEM_W_STREAM_1	3		/* the stream path's step markers */
+#define SEM_W_STREAM_2	4
+#define SEM_W_STREAM_3	5
+#define SEM_OFF(w)	((w) * 4)
+
+/* the stream path's per-step completion values (word 3, 4, 5) */
+#define STREAM_MARK(i)	(0x57ea0000u + (uint32_t)(i))
+
+/* increasing timeline values, as a real timeline semaphore's waits */
+#define TL_BLIT		0x5e000001u
+#define TL_CROSS	0x5e000002u
+#define TL_GRAPH	0x5e000003u
+#define TL_STREAMS	0x5e000004u
+#define EVT_BLIT	0xe17e0001u
+#define EVT_CROSS	0xbeef0002u
+
+/* the saxpy-style kernel the graph's launch node runs (see saxpy.c) */
+#define GN_N		512		/* elements the kernel processes */
+#define GN_BLOCK	64		/* threads per block (multiple of 32) */
+#define GN_GRID		(GN_N / GN_BLOCK)
+#define GN_A		3
+#define GN_B		7
+#define GN_IN_BASE	1024		/* word index of in[]  (page 1) */
+#define GN_OUT_BASE	2048		/* word index of out[] (page 2) */
+#define GN_IN_OFF	4096		/* byte offset of in[]  (page aligned) */
+#define GN_OUT_OFF	8192		/* byte offset of out[] (page aligned) */
+#define ARGS_PAGES	4
+#define GN_POISON	0xdeadbeefu
+
+/* the kernel: out[i] = a * in[i] + b, i = global thread id */
+static const struct vgpu_instr vgpu_saxpy_code[] = {
+	{ .op = VGPU_ISA_MOVI, .dst = 15, .a = 0 },	/* r15 = 0 */
+	{ .op = VGPU_ISA_LD,   .dst = 1,  .a = 15, .b = 1 }, /* a */
+	{ .op = VGPU_ISA_LD,   .dst = 2,  .a = 15, .b = 2 }, /* b */
+	{ .op = VGPU_ISA_LD,   .dst = 3,  .a = 15, .b = 3 }, /* in_base */
+	{ .op = VGPU_ISA_LD,   .dst = 4,  .a = 15, .b = 4 }, /* out_base */
+	{ .op = VGPU_ISA_ADD,  .dst = 5,  .a = 3,  .b = 0 }, /* in + tid */
+	{ .op = VGPU_ISA_LD,   .dst = 6,  .a = 5,  .b = 0 }, /* in[tid] */
+	{ .op = VGPU_ISA_MUL,  .dst = 7,  .a = 1,  .b = 6 }, /* a * in[tid] */
+	{ .op = VGPU_ISA_ADD,  .dst = 8,  .a = 7,  .b = 2 }, /* + b */
+	{ .op = VGPU_ISA_ADD,  .dst = 9,  .a = 4,  .b = 0 }, /* out + tid */
+	{ .op = VGPU_ISA_ST,   .dst = 8,  .a = 9,  .b = 0 }, /* out[tid] = */
+	{ .op = VGPU_ISA_EXIT },
+};
+
+/*
+ * Poll a word of the mmap'ed semaphore page. This is the whole of the
+ * phase G completion path: a load from memory, no ioctl. Bounded so a
+ * broken driver fails the test instead of hanging the autorun.
+ */
+static uint32_t sem_poll(volatile uint32_t *sem, uint32_t word, uint32_t want,
+			 unsigned timeout_ms)
+{
+	unsigned i;
+
+	for (i = 0; i <= timeout_ms / 2; i++) {
+		if (sem[word] == want)
+			break;
+		usleep(2000);
+	}
+	return sem[word];
+}
+
+static int sem_check(volatile uint32_t *sem, uint32_t word, uint32_t want,
+		     const char *what)
+{
+	if (sem[word] != want) {
+		fprintf(stderr, "FAIL: %s: word%u = 0x%08x, want 0x%08x\n",
+			what, word, sem[word], want);
+		return -1;
+	}
+	printf("[pid %d] PASS: %s: word%u = 0x%08x\n", (int)getpid(), what,
+	       word, want);
+	return 0;
+}
+
+/* poll for a word, then report it (the stream path's step markers) */
+static int sem_poll_check(volatile uint32_t *sem, uint32_t word, uint32_t want,
+			  const char *what)
+{
+	if (sem_poll(sem, word, want, 5000) != want) {
+		fprintf(stderr, "FAIL: %s: word%u = 0x%08x, want 0x%08x\n",
+			what, word, sem[word], want);
+		return -1;
+	}
+	printf("[pid %d] PASS: %s: word%u = 0x%08x\n", (int)getpid(), what,
+	       word, want);
+	return 0;
+}
+
+/* ring one stream's doorbell for the npkts packets already in its ring */
+static int stream_ring(int fd, uint32_t qid, uint32_t npkts,
+		       uint32_t *seqno_out)
+{
+	struct vgpu_doorbell db;
+
+	memset(&db, 0, sizeof(db));
+	db.qid = qid;
+	db.put = npkts * (uint32_t)sizeof(struct vgpu_packet);
+	if (check(fd, &db, DRM_IOCTL_VGPU_DOORBELL, "doorbell(stream step)"))
+		return -1;
+	*seqno_out = db.seqno;
+	return 0;
+}
+
+/* a byte-for-byte comparison (the DMA result of a batch) */
+static int data_check_pattern(const uint8_t *a, const uint8_t *b, int len,
+			      const char *what)
+{
+	int i;
+
+	for (i = 0; i < len; i++) {
+		if (a[i] != b[i]) {
+			fprintf(stderr,
+				"FAIL: %s: mismatch at %d (0x%02x != 0x%02x)\n",
+				what, i, a[i], b[i]);
+			return -1;
+		}
+	}
+	printf("[pid %d] PASS: %s (%d bytes identical)\n", (int)getpid(),
+	       what, len);
+	return 0;
+}
+
+/* out[i] = a * in[i] + b, as the kernel in this test computes it */
+static int data_check_saxpy(const uint32_t *out, const uint32_t *in,
+			    const char *what)
+{
+	int i;
+
+	for (i = 0; i < GN_N; i++) {
+		uint32_t want = GN_A * in[i] + GN_B;
+
+		if (out[i] != want) {
+			fprintf(stderr,
+				"FAIL: %s: out[%d] = %u, want %u\n",
+				what, i, out[i], want);
+			return -1;
+		}
+	}
+	printf("[pid %d] PASS: %s: out[i] = %u*in[i] + %u "
+	       "(%d elements verified)\n", (int)getpid(), what, GN_A, GN_B,
+	       GN_N);
+	return 0;
+}
+
+static int run_sync(void)
+{
+	int fd;
+	int rc = 1;
+	int i;
+	uint32_t sem_handle, src_handle, dst_handle, args_handle;
+	uint32_t res_handle, res2_handle;
+	uint32_t qid_gfx = 0, qid_copy = 0, kid = 0;
+	uint32_t graph_seqno = 0;
+	uint32_t sqid[4];
+	uint32_t stream_seqno[4] = { 0, 0, 0, 0 };
+	volatile uint32_t *sem;
+	uint32_t *src, *dst, *args, *res, *res2;
+	uint8_t *ring = NULL, *cring = NULL;
+	uint8_t *sring[4];
+	struct vgpu_packet *pk, *cpk, *spk;
+	struct vgpu_bo_create bo;
+	struct vgpu_sem_bind sb;
+	struct vgpu_queue_create qc;
+	struct vgpu_module_load ml;
+	struct vgpu_doorbell db;
+	struct vgpu_query q, before;
+	struct vgpu_graph_node nodes[4], cyc[2];
+	struct vgpu_graph_submit gs;
+
+	fd = open("/dev/dri/renderD128", O_RDWR);
+	if (fd < 0)
+		fd = open("/dev/dri/card0", O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "FAIL: open: %s\n", strerror(errno));
+		return 1;
+	}
+
+	/* ---- the semaphore page: a BO the CPU polls ---------------- */
+	memset(&bo, 0, sizeof(bo));
+	bo.size = SEM_BO_WORDS * 4;
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create(sem)"))
+		goto out;
+	sem_handle = bo.handle;
+	sem = xmap(fd, bo.mmap_offset, bo.size);
+
+	/* ---- the work buffers -------------------------------------- */
+	/*
+	 * src holds the input pattern on page 1, at the same offset the
+	 * kernel's in[] sits at inside the argument buffer: a graph COPY
+	 * node carries ONE offset for both BOs, so the copy-in has to be
+	 * legal at that offset in each of them.
+	 */
+	memset(&bo, 0, sizeof(bo));
+	bo.size = ARGS_PAGES * 4096;
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create(src)"))
+		goto out;
+	src_handle = bo.handle;
+	src = xmap(fd, bo.mmap_offset, bo.size);
+	for (i = 0; i < ARGS_PAGES * 1024; i++)
+		src[i] = 2 * i + 1;
+
+	memset(&bo, 0, sizeof(bo));
+	bo.size = 4096;
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create(dst)"))
+		goto out;
+	dst_handle = bo.handle;
+	dst = xmap(fd, bo.mmap_offset, bo.size);
+	memset(dst, 0, bo.size);
+
+	/* page 0: the kernel's parameter header; 1: in[]; 2: out[] */
+	memset(&bo, 0, sizeof(bo));
+	bo.size = ARGS_PAGES * 4096;
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create(args)"))
+		goto out;
+	args_handle = bo.handle;
+	args = xmap(fd, bo.mmap_offset, bo.size);
+	args[0] = GN_N;
+	args[1] = GN_A;
+	args[2] = GN_B;
+	args[3] = GN_IN_BASE;
+	args[4] = GN_OUT_BASE;
+	/* poison in[] and out[]: the copy node and the launch must
+	 * overwrite both for the checks below to pass */
+	for (i = 0; i < 2 * 1024; i++)
+		args[GN_IN_BASE + i] = GN_POISON;
+
+	/*
+	 * The result BOs are the same shape as the argument buffer: a
+	 * graph COPY node carries ONE offset for both BOs, so the
+	 * copy-out (args@GN_OUT_OFF -> res@GN_OUT_OFF) needs a page 2
+	 * to land in.
+	 */
+	memset(&bo, 0, sizeof(bo));
+	bo.size = ARGS_PAGES * 4096;
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create(res)"))
+		goto out;
+	res_handle = bo.handle;
+	res = xmap(fd, bo.mmap_offset, bo.size);
+
+	memset(&bo, 0, sizeof(bo));
+	bo.size = ARGS_PAGES * 4096;
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create(res2)"))
+		goto out;
+	res2_handle = bo.handle;
+	res2 = xmap(fd, bo.mmap_offset, bo.size);
+
+	/* ---- install this fd's semaphore page ----------------------- */
+	memset(&sb, 0, sizeof(sb));
+	sb.bo_handle = sem_handle;
+	sb.sem_off = SEM_OFF(SEM_W_TIMELINE);
+	if (check(fd, &sb, DRM_IOCTL_VGPU_SEM_BIND, "sem_bind"))
+		goto out;
+	if (!sb.bound) {
+		fprintf(stderr, "FAIL: sem_bind did not report bound\n");
+		goto out;
+	}
+	printf("[pid %d] PASS: sem_bind: bo#%u word_off=%u bound\n",
+	       (int)getpid(), sb.bo_handle, sb.sem_off);
+
+	/* the two ways to bind badly: a handle we do not own, a
+	 * misaligned word */
+	memset(&sb, 0, sizeof(sb));
+	sb.bo_handle = 0xdead;
+	if (expect_errno(fd, &sb, DRM_IOCTL_VGPU_SEM_BIND, ENOENT,
+			 "sem_bind(unknown handle)"))
+		goto out;
+	memset(&sb, 0, sizeof(sb));
+	sb.bo_handle = sem_handle;
+	sb.sem_off = 2;
+	if (expect_errno(fd, &sb, DRM_IOCTL_VGPU_SEM_BIND, EINVAL,
+			 "sem_bind(unaligned sem_off)"))
+		goto out;
+
+	/* ---- two streams: GFX and COPY ------------------------------ */
+	memset(&qc, 0, sizeof(qc));
+	qc.engine = VGPU_ENGINE_GFX;
+	qc.prio = 1;
+	qc.nslots = 64;
+	if (check(fd, &qc, DRM_IOCTL_VGPU_QUEUE_CREATE, "queue_create(gfx)"))
+		goto out;
+	qid_gfx = qc.qid;
+	ring = xmap(fd, qc.mmap_offset, qc.ring_size);
+
+	memset(&qc, 0, sizeof(qc));
+	qc.engine = VGPU_ENGINE_COPY;
+	qc.prio = 1;
+	qc.nslots = 64;
+	if (check(fd, &qc, DRM_IOCTL_VGPU_QUEUE_CREATE, "queue_create(copy)"))
+		goto out;
+	qid_copy = qc.qid;
+	cring = xmap(fd, qc.mmap_offset, qc.ring_size);
+	pk = (struct vgpu_packet *)ring;
+	cpk = (struct vgpu_packet *)cring;
+
+	/* ---- the kernel the graph's launch node will run ------------ */
+	memset(&ml, 0, sizeof(ml));
+	ml.nregs = 16;
+	ml.smem = 0;
+	ml.ninstr = sizeof(vgpu_saxpy_code) / sizeof(vgpu_saxpy_code[0]);
+	ml.code = (uint64_t)(uintptr_t)vgpu_saxpy_code;
+	if (check(fd, &ml, DRM_IOCTL_VGPU_MODULE_LOAD, "module_load"))
+		goto out;
+	kid = ml.kid;
+
+	/*
+	 * ==== A: a batch whose LAST packet is SIGNAL_TIMELINE ========
+	 * copy + an event slot + the timeline signal, then find out it
+	 * happened by reading the mmap'ed page. No VGPU_WAIT.
+	 */
+	memset(pk, 0, 3 * sizeof(*pk));
+	pk[0].type = VGPU_PKT_COPY;
+	pk[0].copy.src_bo = src_handle;
+	pk[0].copy.dst_bo = dst_handle;
+	pk[0].copy.off = 0;
+	pk[0].copy.len = 4096;
+	pk[1].type = VGPU_PKT_WRITE_EVENT;
+	pk[1].timeline.sem_bo = sem_handle;
+	pk[1].timeline.sem_off = SEM_OFF(SEM_W_EVENT_A);
+	pk[1].timeline.value = EVT_BLIT;
+	pk[2].type = VGPU_PKT_SIGNAL_TIMELINE;
+	pk[2].timeline.sem_bo = sem_handle;
+	pk[2].timeline.sem_off = SEM_OFF(SEM_W_TIMELINE);
+	pk[2].timeline.value = TL_BLIT;
+
+	memset(&db, 0, sizeof(db));
+	db.qid = qid_gfx;
+	db.put = 3 * (uint32_t)sizeof(*pk);
+	if (check(fd, &db, DRM_IOCTL_VGPU_DOORBELL, "doorbell(blit+signal)"))
+		goto out;
+
+	if (sem_poll(sem, SEM_W_TIMELINE, TL_BLIT, 5000) != TL_BLIT) {
+		fprintf(stderr,
+			"FAIL: timeline word%u = 0x%08x, want 0x%08x "
+			"(no VGPU_WAIT was issued)\n",
+			SEM_W_TIMELINE, sem[SEM_W_TIMELINE], TL_BLIT);
+		goto out;
+	}
+	printf("[pid %d] PASS: timeline semaphore: word0 = 0x%08x seen by "
+	       "POLLING THE MMAP (no VGPU_WAIT issued)\n", (int)getpid(),
+	       sem[SEM_W_TIMELINE]);
+	if (sem_check(sem, SEM_W_EVENT_A, EVT_BLIT, "event slot A"))
+		goto out;
+	if (data_check_pattern((const uint8_t *)dst, (const uint8_t *)src,
+			       4096, "blit in the same batch"))
+		goto out;
+
+	/*
+	 * ==== A2: the ENGINE waits, not the CPU =====================
+	 * The copy engine's batch stalls on WAIT_TIMELINE until the GFX
+	 * engine writes the next timeline value. We discover the wait
+	 * was satisfied by polling the event slot the copy engine
+	 * writes after it — again, no ioctl.
+	 */
+	memset(cpk, 0, 2 * sizeof(*cpk));
+	cpk[0].type = VGPU_PKT_WAIT_TIMELINE;
+	cpk[0].timeline.sem_bo = sem_handle;
+	cpk[0].timeline.sem_off = SEM_OFF(SEM_W_TIMELINE);
+	cpk[0].timeline.value = TL_CROSS;
+	cpk[1].type = VGPU_PKT_WRITE_EVENT;
+	cpk[1].timeline.sem_bo = sem_handle;
+	cpk[1].timeline.sem_off = SEM_OFF(SEM_W_EVENT_B);
+	cpk[1].timeline.value = EVT_CROSS;
+
+	memset(&db, 0, sizeof(db));
+	db.qid = qid_copy;
+	db.put = 2 * (uint32_t)sizeof(*cpk);
+	if (check(fd, &db, DRM_IOCTL_VGPU_DOORBELL,
+		  "doorbell(copy engine waits)"))
+		goto out;
+
+	/* the GFX engine is what releases the copy engine */
+	memset(pk + 3, 0, 2 * sizeof(*pk));
+	pk[3].type = VGPU_PKT_NOP;
+	pk[4].type = VGPU_PKT_SIGNAL_TIMELINE;
+	pk[4].timeline.sem_bo = sem_handle;
+	pk[4].timeline.sem_off = SEM_OFF(SEM_W_TIMELINE);
+	pk[4].timeline.value = TL_CROSS;
+
+	memset(&db, 0, sizeof(db));
+	db.qid = qid_gfx;
+	db.put = 5 * (uint32_t)sizeof(*pk);
+	if (check(fd, &db, DRM_IOCTL_VGPU_DOORBELL,
+		  "doorbell(gfx signals)"))
+		goto out;
+
+	if (sem_poll(sem, SEM_W_EVENT_B, EVT_CROSS, 5000) != EVT_CROSS) {
+		fprintf(stderr,
+			"FAIL: copy engine's event word2 = 0x%08x, want 0x%08x "
+			"(its WAIT_TIMELINE never released)\n",
+			sem[SEM_W_EVENT_B], EVT_CROSS);
+		goto out;
+	}
+	printf("[pid %d] PASS: cross-engine WAIT_TIMELINE: the copy engine "
+	       "stalled on word0 until the GFX engine wrote 0x%08x; "
+	       "the CPU never blocked\n", (int)getpid(), TL_CROSS);
+	if (sem_check(sem, SEM_W_EVENT_B, EVT_CROSS, "event slot B"))
+		goto out;
+
+	/*
+	 * ==== B: one doorbell for a whole DAG ========================
+	 * n0 copy-in, n1 copy-out (deps: n2), n2 launch (deps: n0),
+	 * n3 signal (deps: n1). The engine must run [0, 2, 1, 3].
+	 */
+	memset(nodes, 0, sizeof(nodes));
+	nodes[0].type = VGPU_PKT_COPY;
+	nodes[0].copy.src_bo = src_handle;
+	nodes[0].copy.dst_bo = args_handle;
+	nodes[0].copy.off = GN_IN_OFF;
+	nodes[0].copy.len = 4096;
+	nodes[1].type = VGPU_PKT_COPY;
+	nodes[1].copy.src_bo = args_handle;
+	nodes[1].copy.dst_bo = res_handle;
+	nodes[1].copy.off = GN_OUT_OFF;
+	nodes[1].copy.len = 4096;
+	nodes[1].ndeps = 1;
+	nodes[1].deps[0] = 2;		/* after the launch */
+	nodes[2].type = VGPU_PKT_LAUNCH;
+	nodes[2].launch.kid = kid;
+	nodes[2].launch.grid = GN_GRID;
+	nodes[2].launch.block = GN_BLOCK;
+	nodes[2].launch.args_bo = args_handle;
+	nodes[2].launch.args_off = 0;
+	nodes[2].ndeps = 1;
+	nodes[2].deps[0] = 0;		/* after the copy-in */
+	nodes[3].type = VGPU_PKT_SIGNAL_TIMELINE;
+	nodes[3].sem.sem_bo = sem_handle;
+	nodes[3].sem.sem_off = SEM_OFF(SEM_W_TIMELINE);
+	nodes[3].sem.value = TL_GRAPH;
+	nodes[3].ndeps = 1;
+	nodes[3].deps[0] = 1;		/* after the copy-out */
+
+	printf("[pid %d] graph DAG: n0=copy-in, n1=copy-out(deps n2), "
+	       "n2=launch grid=%u block=%u (deps n0), n3=signal(deps n1)\n",
+	       (int)getpid(), GN_GRID, GN_BLOCK);
+
+	memset(&before, 0, sizeof(before));
+	if (check(fd, &before, DRM_IOCTL_VGPU_QUERY, "query(before graph)"))
+		goto out;
+
+	memset(&gs, 0, sizeof(gs));
+	gs.nodes = (uint64_t)(uintptr_t)nodes;
+	gs.qid = qid_gfx;
+	gs.nnodes = 4;
+	gs.nedges = 0;
+	if (check(fd, &gs, DRM_IOCTL_VGPU_GRAPH, "graph"))
+		goto out;
+	graph_seqno = gs.seqno;
+	printf("[pid %d] graph: 4 nodes behind ONE doorbell -> seq#%u\n",
+	       (int)getpid(), graph_seqno);
+
+	if (sem_poll(sem, SEM_W_TIMELINE, TL_GRAPH, 5000) != TL_GRAPH) {
+		fprintf(stderr,
+			"FAIL: graph timeline word%u = 0x%08x, want 0x%08x\n",
+			SEM_W_TIMELINE, sem[SEM_W_TIMELINE], TL_GRAPH);
+		goto out;
+	}
+	printf("[pid %d] PASS: graph done: word0 = 0x%08x (polled, "
+	       "no VGPU_WAIT)\n", (int)getpid(), sem[SEM_W_TIMELINE]);
+	/*
+	 * The copy-out (node 1) ran AFTER the launch (node 2): if the
+	 * nodes had run in index order this would be the poison. The
+	 * result landed at the same offset the copy node used.
+	 */
+	if (data_check_saxpy(res + GN_OUT_BASE, src + GN_IN_BASE,
+			     "graph: node 1 copied the LAUNCH's output"))
+		goto out;
+
+	memset(&q, 0, sizeof(q));
+	if (check(fd, &q, DRM_IOCTL_VGPU_QUERY, "query(after graph)"))
+		goto out;
+	printf("[pid %d] PASS: graph cost: submitted +%u (4 nodes, 1 ioctl), "
+	       "graphs +%u, signals +%u, events +%u\n", (int)getpid(),
+	       q.submitted - before.submitted, q.graphs - before.graphs,
+	       q.signals - before.signals, q.events - before.events);
+
+	/*
+	 * ==== B2: the same work as four separate doorbells ==========
+	 * Four streams, four doorbells, four fences — and the dependency
+	 * expressed only as "submit them in this order and hope": here
+	 * the CPU polls each step's memory word before the next ring,
+	 * which is exactly how an app orders streams without events.
+	 * Still no VGPU_WAIT.
+	 *
+	 * One stream per step on purpose: a doorbell covers [get, put),
+	 * and the word the engine writes lands BEFORE the bottom half
+	 * advances get, so two rings on one queue can cover the same
+	 * packets twice. Separate rings make that impossible.
+	 */
+	for (i = 0; i < 1024; i++)
+		args[GN_OUT_BASE + i] = GN_POISON;
+
+	for (i = 0; i < 4; i++) {
+		memset(&qc, 0, sizeof(qc));
+		qc.engine = VGPU_ENGINE_GFX;
+		qc.prio = 1;
+		qc.nslots = 64;
+		if (check(fd, &qc, DRM_IOCTL_VGPU_QUEUE_CREATE,
+			  "queue_create(stream)"))
+			goto out;
+		sqid[i] = qc.qid;
+		sring[i] = xmap(fd, qc.mmap_offset, qc.ring_size);
+		printf("[pid %d] stream q#%u (GFX engine)\n", (int)getpid(),
+		       sqid[i]);
+	}
+
+	/* step 0: copy the input page into the argument buffer */
+	spk = (struct vgpu_packet *)sring[0];
+	memset(spk, 0, 2 * sizeof(*spk));
+	spk[0].type = VGPU_PKT_COPY;
+	spk[0].copy.src_bo = src_handle;
+	spk[0].copy.dst_bo = args_handle;
+	spk[0].copy.off = GN_IN_OFF;
+	spk[0].copy.len = 4096;
+	spk[1].type = VGPU_PKT_WRITE_EVENT;
+	spk[1].timeline.sem_bo = sem_handle;
+	spk[1].timeline.sem_off = SEM_OFF(SEM_W_STREAM_1);
+	spk[1].timeline.value = STREAM_MARK(1);
+	if (stream_ring(fd, sqid[0], 2, &stream_seqno[0]))
+		goto out;
+	if (sem_poll_check(sem, SEM_W_STREAM_1, STREAM_MARK(1),
+			   "stream step 0 (copy-in)"))
+		goto out;
+
+	/* step 1: the launch over the page step 0 just wrote */
+	spk = (struct vgpu_packet *)sring[1];
+	memset(spk, 0, 2 * sizeof(*spk));
+	spk[0].type = VGPU_PKT_LAUNCH;
+	spk[0].launch.kid = kid;
+	spk[0].launch.grid = GN_GRID;
+	spk[0].launch.block = GN_BLOCK;
+	spk[0].launch.args_bo = args_handle;
+	spk[0].launch.args_off = 0;
+	spk[1].type = VGPU_PKT_WRITE_EVENT;
+	spk[1].timeline.sem_bo = sem_handle;
+	spk[1].timeline.sem_off = SEM_OFF(SEM_W_STREAM_2);
+	spk[1].timeline.value = STREAM_MARK(2);
+	if (stream_ring(fd, sqid[1], 2, &stream_seqno[1]))
+		goto out;
+	if (sem_poll_check(sem, SEM_W_STREAM_2, STREAM_MARK(2),
+			   "stream step 1 (launch)"))
+		goto out;
+
+	/* step 2: copy the launch's output out of the argument buffer */
+	spk = (struct vgpu_packet *)sring[2];
+	memset(spk, 0, 2 * sizeof(*spk));
+	spk[0].type = VGPU_PKT_COPY;
+	spk[0].copy.src_bo = args_handle;
+	spk[0].copy.dst_bo = res2_handle;
+	spk[0].copy.off = GN_OUT_OFF;
+	spk[0].copy.len = 4096;
+	spk[1].type = VGPU_PKT_WRITE_EVENT;
+	spk[1].timeline.sem_bo = sem_handle;
+	spk[1].timeline.sem_off = SEM_OFF(SEM_W_STREAM_3);
+	spk[1].timeline.value = STREAM_MARK(3);
+	if (stream_ring(fd, sqid[2], 2, &stream_seqno[2]))
+		goto out;
+	if (sem_poll_check(sem, SEM_W_STREAM_3, STREAM_MARK(3),
+			   "stream step 2 (copy-out)"))
+		goto out;
+
+	/* step 3: the timeline signal the CPU polls for */
+	spk = (struct vgpu_packet *)sring[3];
+	memset(spk, 0, sizeof(*spk));
+	spk[0].type = VGPU_PKT_SIGNAL_TIMELINE;
+	spk[0].timeline.sem_bo = sem_handle;
+	spk[0].timeline.sem_off = SEM_OFF(SEM_W_TIMELINE);
+	spk[0].timeline.value = TL_STREAMS;
+	if (stream_ring(fd, sqid[3], 1, &stream_seqno[3]))
+		goto out;
+
+	if (sem_poll(sem, SEM_W_TIMELINE, TL_STREAMS, 5000) != TL_STREAMS) {
+		fprintf(stderr,
+			"FAIL: stream timeline word%u = 0x%08x, want 0x%08x\n",
+			SEM_W_TIMELINE, sem[SEM_W_TIMELINE], TL_STREAMS);
+		goto out;
+	}
+	printf("[pid %d] streams: the same 4 units of work as 4 doorbells "
+	       "(seq#%u %u %u %u)\n", (int)getpid(), stream_seqno[0],
+	       stream_seqno[1], stream_seqno[2], stream_seqno[3]);
+	if (data_check_saxpy(res2 + GN_OUT_BASE, src + GN_IN_BASE,
+			     "streams: same work, 4 doorbells"))
+		goto out;
+
+	memset(&q, 0, sizeof(q));
+	if (check(fd, &q, DRM_IOCTL_VGPU_QUERY, "query(after streams)"))
+		goto out;
+	printf("[pid %d] PASS: stream cost: submitted +%u for the same 4 "
+	       "units of work (4 doorbells)\n", (int)getpid(),
+	       q.submitted - before.submitted - 1);
+	printf("[pid %d] doorbell comparison: graph 1 vs streams 4 "
+	       "for identical work -> 4x fewer submissions\n",
+	       (int)getpid());
+
+	/*
+	 * ==== C: the phase G rejections ==============================
+	 * A sync packet naming a BO this fd did not bind, and a cyclic
+	 * DAG (rejected before any node is resolved).
+	 */
+	memset(pk + 12, 0, sizeof(*pk));
+	pk[12].type = VGPU_PKT_SIGNAL_TIMELINE;
+	pk[12].timeline.sem_bo = dst_handle;	/* ours, but not the bound one */
+	pk[12].timeline.sem_off = SEM_OFF(SEM_W_TIMELINE);
+	pk[12].timeline.value = 0xffff;
+	memset(&db, 0, sizeof(db));
+	db.qid = qid_gfx;
+	db.put = 13 * (uint32_t)sizeof(*pk);
+	if (expect_errno(fd, &db, DRM_IOCTL_VGPU_DOORBELL, EINVAL,
+			 "doorbell(signal on an unbound BO)"))
+		goto out;
+
+	memset(cyc, 0, sizeof(cyc));
+	cyc[0].type = VGPU_PKT_NOP;
+	cyc[0].ndeps = 1;
+	cyc[0].deps[0] = 1;
+	cyc[1].type = VGPU_PKT_NOP;
+	cyc[1].ndeps = 1;
+	cyc[1].deps[0] = 0;
+	memset(&gs, 0, sizeof(gs));
+	gs.nodes = (uint64_t)(uintptr_t)cyc;
+	gs.qid = qid_gfx;
+	gs.nnodes = 2;
+	if (expect_errno(fd, &gs, DRM_IOCTL_VGPU_GRAPH, EINVAL,
+			 "graph(cyclic DAG)"))
+		goto out;
+
+	printf("phase G: timeline semaphore, event slots, cross-engine wait, "
+	       "4-node graph on one doorbell; no VGPU_WAIT was issued\n");
+	rc = 0;
+
+out:
+	close(fd);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	int m = 1, i;
+
+	if (argc > 1 && !strcmp(argv[1], "-g"))
+		return run_sync() ? 1 : 0;
 
 	if (argc > 1 && !strcmp(argv[1], "-m"))
 		m = (argc > 2) ? atoi(argv[2]) : 4;
