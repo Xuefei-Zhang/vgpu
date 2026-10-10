@@ -259,23 +259,32 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | A | 多引擎多队列（stream 语义） | ✅ 已完成并 guest 验证 | `1657cdc` |
 | B | 门铃 + 引擎侧取指（packet 提交） | ✅ 已完成并 guest 验证 | `8ebd16f` |
 | D | 计算语义：kernel launch / warp 执行 / 合并率 | ✅ 已完成并 guest 验证 | `f6b9b0c` |
+| G | 内存语义同步：timeline semaphore / event / 图提交 | ✅ 已完成并 guest 验证 | `b9f0789` |
 | C, E–J | 见上表 | ⬜ 待开发 | — |
 
 **已交付内容**：per-fd 多队列（每队列独立 ring + fence timeline + doorbell）、三个引擎（gfx/copy/compute）各自
 ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、7 指令教学 ISA +
 warp 同步执行器 + LAUNCH packet + MODULE_LOAD 模块注册 + broadcast/coalesced/strided 三类访存统计、
 debugfs `queues`/`compute` 视图、`-q`/`-p`/saxpy 测试与 autorun 集成。
+**同步（Phase G）**：VGPU_SEM_BIND 装订 per-fd semaphore page；SIGNAL/WAIT_TIMELINE 与 WRITE_EVENT 包
+直接在"CPU 可 poll 的内存"上写/等；VGPU_GRAPH 一次 doorbell 提交整张 DAG（ioctl 内拓扑排序）；
+debugfs `sync` 视图。用户态 `-g` 模式**全程不调 VGPU_WAIT**：poll mmap 等到 timeline 值，
+4 节点图（copy-in → launch → copy-out → signal，索引序 ≠ 依赖序，靠数据依赖证明执行序）
+与等价 4 次独立 doorbell 用 `submitted` 计数器对比（1 vs 4）。
 **实例**：`userspace/examples/saxpy.c`——CUDA SAXPY 的 vgpu 对应实现，4096 元素全对；
 入门/测试/trace/实例教学见 `docs/GETTING-STARTED.md`。
 
-**过程中抓到并修复的 4 个真 bug**（都有 guest 证据，写入各自 commit message）：
+**过程中抓到并修复的 5 个真 bug**（都有 guest 证据，写入各自 commit message）：
 1. 自旋锁内调可睡眠 API（`drm_gem_shmem_pin` 的页分配 + `set_pages_array`）
 2. `container_of` 数组元素陷阱：减了数组基址偏移导致 engine 1/2 的设备指针错位
 3. 设备级 scratch 水位按**完成序**回收——多引擎并发才暴露的分配/回收乱序
 4. **三种尺寸混淆**：ring 槽 64B / command 结构 48B / packet 40B，混用导致 scratch 水位下溢 48B/批
+5. **blit 页数组二次加偏移**：pin 时数组就是区间本身，`vgpu_blit_pages`/`vgpu_blit_unref`
+   又加了一次 `blit_off`——offset 0 时看不见，Phase G 的 graph COPY 节点第一次踩到
+   （KASAN slab-out-of-bounds → memcpy 踩野 page → GPF panic，guest 全日志可见）
 
 **下一步建议**：C（VMID/VA/页表+显存管理）与 A/B/D 无依赖，`~/self/wt/c` 工作树已就绪；
-E（UVM 迁移）依赖 C+D；F（抢占）依赖 D；G（同步/图）依赖 B；H（fault containment）依赖 C+D。
+E（UVM 迁移）依赖 C+D；F（抢占）依赖 D；H（fault containment）依赖 C+D；I（功耗/DVFS）依赖 D。
 
 ## 10. 里程碑总览
 
