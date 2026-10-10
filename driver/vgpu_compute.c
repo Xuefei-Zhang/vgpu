@@ -12,6 +12,14 @@
  * (ns per access class), instructions retire in program order. The
  * mechanism being taught is what a launch IS, not how an SM pipelines
  * it.
+ *
+ * Phase F adds preemption and timeslicing: a launch no longer has to
+ * retire its whole grid in one go. The executor polls
+ * vgpu_sched_check() at every instruction boundary — the safe points a
+ * real GPU offers its scheduler, because there is no wire the CPU can
+ * pull to make a shader stop — and, when told to yield, saves the
+ * cursor (block/warp/pc) plus the register file into sub->cs so the
+ * engine can run somebody else's kernel and later resume this one.
  */
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -19,11 +27,16 @@
 #include "vgpu.h"
 
 #define VGPU_SM_COUNT		2	/* simulated SMs */
-#define VGPU_WARP		32	/* lanes per warp */
 #define VGPU_MAX_THREADS_SM	256	/* occupancy ceiling per SM */
 #define VGPU_MEM_LAT_NS		40	/* global-memory latency model */
 
-#define VGPU_NREGS		16
+/*
+ * Modelled per-block SM time. Not a sleep: a busy delay, exactly like
+ * the one VGPU_OP_NOP uses, so the modelled work has real wall-clock
+ * length and a timeslice shows up in ftrace (and so a launch is still
+ * in flight when a higher-priority doorbell arrives).
+ */
+#define VGPU_BLOCK_US		20
 
 #define R(i)			regs[(i) & (VGPU_NREGS - 1)]
 
@@ -42,6 +55,13 @@ static u32 vgpu_mem_word(struct vgpu_submission *sub, u32 addr, bool write,
 }
 
 /*
+ * One warp's register file — now a per-launch object, not a scratch
+ * buffer: with preemption a launch can be paused mid-warp, so the
+ * registers have to survive across context switches. It lives in
+ * sub->cs (see vgpu.h) and is freed when the grid retires.
+ */
+
+/*
  * One WARP, executed synchronously (SIMT: lanes step the same
  * instruction — no branch instructions exist in this ISA, so lockstep
  * is exact, not an approximation).
@@ -57,32 +77,35 @@ static u32 vgpu_mem_word(struct vgpu_submission *sub, u32 addr, bool write,
  * it measured the first word each thread touched, which for saxpy is
  * the same parameter word for every lane, and "measured" 100%
  * uncoalesced for a perfectly coalesced kernel).
+ *
+ * Resumable (phase F): runs from cs->pc to EXIT or to a yield. Returns
+ * VGPU_SCHED_DONE when the warp retired; otherwise the reason the
+ * scheduler wants the engine back, with pc/resuming set so the next
+ * call continues this exact warp — the saved register file IS the
+ * context.
  */
-/*
- * One warp's register file. Heap-allocated once per launch (the engine
- * executes one submission at a time, so a single frame is reused by
- * every warp): 32 lanes x 16 registers on the kernel stack would
- * exceed the 2048-byte frame limit.
- */
-struct vgpu_warp_frame {
-	u32 regs[VGPU_WARP][VGPU_NREGS];
-	bool done[VGPU_WARP];
-};
-
-static void vgpu_run_warp(struct vgpu *v, struct vgpu_submission *sub,
-			  struct vgpu_warp_frame *fw, u32 base_tid)
+static enum vgpu_sched vgpu_run_warp(struct vgpu *v,
+				     struct vgpu_submission *sub,
+				     struct vgpu_launch *cs, u32 base_tid)
 {
 	struct vgpu_kernel *k = sub->kernel;
+	struct vgpu_warp_frame *fw = cs->fw;
 	u32 (*regs)[VGPU_NREGS] = fw->regs;
 	bool *done = fw->done;
-	bool all_done = false;
 	u32 pc, lane;
+	bool all_done = false;
 
-	memset(fw, 0, sizeof(*fw));
-	for (lane = 0; lane < VGPU_WARP; lane++)
-		regs[lane][0] = base_tid + lane;
+	if (cs->resuming) {
+		pc = cs->pc;		/* continue the interrupted warp */
+	} else {
+		memset(fw, 0, sizeof(*fw));
+		for (lane = 0; lane < VGPU_WARP; lane++)
+			regs[lane][0] = base_tid + lane;
+		pc = 0;
+	}
+	cs->resuming = false;
 
-	for (pc = 0; pc < k->ninstr && !all_done; pc++) {
+	for (; pc < k->ninstr && !all_done; pc++) {
 		struct vgpu_instr *in = &k->code[pc];
 		u32 addr[VGPU_WARP];
 		bool is_mem = in->op == VGPU_ISA_LD || in->op == VGPU_ISA_ST;
@@ -127,70 +150,149 @@ static void vgpu_run_warp(struct vgpu *v, struct vgpu_submission *sub,
 				break;
 			default:
 				sub->error = -EINVAL;
-				return;
+				return VGPU_SCHED_DONE;
 			}
 		}
 
-		if (!is_mem || sub->error)
-			continue;
+		if (sub->error)
+			return VGPU_SCHED_DONE;
 
-		v->cs_mem_ops += VGPU_WARP;
-		for (lane = 0; lane < VGPU_WARP; lane++) {
-			if (done[lane])
-				continue;
-			if (!lane || addr[lane] != first) {
-				if (lane && addr[lane] != first)
-					broadcast = false;
+		if (is_mem) {
+			v->cs_mem_ops += VGPU_WARP;
+			for (lane = 0; lane < VGPU_WARP; lane++) {
+				if (done[lane])
+					continue;
+				if (!lane || addr[lane] != first) {
+					if (lane && addr[lane] != first)
+						broadcast = false;
+				}
+				if (lane) {
+					if (addr[lane] != addr[lane - 1] + 1)
+						coalesced = false;
+				} else {
+					first = addr[lane];
+				}
 			}
-			if (lane) {
-				if (addr[lane] != addr[lane - 1] + 1)
-					coalesced = false;
+			if (broadcast) {
+				v->cs_bcast_warps++;
+			} else if (coalesced) {
+				v->cs_coalesced_warps++;
 			} else {
-				first = addr[lane];
+				v->cs_uncoalesced_warps++;
 			}
 		}
-		if (broadcast) {
-			v->cs_bcast_warps++;
-		} else if (coalesced) {
-			v->cs_coalesced_warps++;
-		} else {
-			v->cs_uncoalesced_warps++;
+
+		/*
+		 * The safe point: instruction boundary, register file
+		 * consistent and the memory metrics for this instruction
+		 * already accounted. A real engine checks a preempt-pending
+		 * bit here; we ask the scheduler directly.
+		 */
+		{
+			enum vgpu_sched r = vgpu_sched_check(v, sub);
+
+			if (r != VGPU_SCHED_DONE) {
+				cs->pc = pc + 1;
+				cs->resuming = true;
+				return r;
+			}
 		}
 	}
+	return VGPU_SCHED_DONE;
 }
 
-void vgpu_compute_run(struct vgpu *v, struct vgpu_submission *sub)
+/*
+ * Account this slice of execution to the context (queue) that owns the
+ * launch: engine time, blocks retired. Under v->lock because debugfs
+ * reads these counters concurrently.
+ */
+static void vgpu_launch_account(struct vgpu *v, struct vgpu_submission *sub,
+				u64 start_ns)
 {
+	unsigned long flags;
+
+	spin_lock_irqsave(&v->lock, flags);
+	sub->q->cs_time_ns += ktime_get_ns() - start_ns;
+	spin_unlock_irqrestore(&v->lock, flags);
+}
+
+/*
+ * Run a kernel launch — or a slice of one (phase F).
+ *
+ * Returns VGPU_SCHED_DONE when the whole grid retired; otherwise the
+ * scheduler's reason for pausing, with the resume point saved in
+ * sub->cs (block/warp/pc + register file). The caller must NOT
+ * complete the submission in that case: no fence, no ring reclaim,
+ * the argument buffer stays pinned.
+ */
+enum vgpu_sched vgpu_compute_run(struct vgpu *v, struct vgpu_submission *sub)
+{
+	struct vgpu_launch *cs = sub->cs;
 	u32 warps_per_block = sub->block / VGPU_WARP;
-	struct vgpu_warp_frame *fw;
-	u32 block, warp;
+	enum vgpu_sched r = VGPU_SCHED_DONE;
 
 	if (!warps_per_block || sub->block % VGPU_WARP) {
 		sub->error = -EINVAL;
-		return;
+		return VGPU_SCHED_DONE;
 	}
 
-	fw = kzalloc(sizeof(*fw), GFP_KERNEL);
-	if (!fw) {
-		sub->error = -ENOMEM;
-		return;
+	if (!cs->started) {
+		cs->fw = kzalloc(sizeof(*cs->fw), GFP_KERNEL);
+		if (!cs->fw) {
+			sub->error = -ENOMEM;
+			return VGPU_SCHED_DONE;
+		}
+		cs->started = true;
 	}
+	cs->start_ns = ktime_get_ns();
 
-	for (block = 0; block < sub->grid && !sub->error; block++) {
-		for (warp = 0; warp < warps_per_block; warp++) {
-			u32 tid = block * sub->block + warp * VGPU_WARP;
+	while (cs->block < sub->grid && !sub->error) {
+		while (cs->warp < warps_per_block) {
+			u32 tid = cs->block * sub->block + cs->warp * VGPU_WARP;
 
-			vgpu_run_warp(v, sub, fw, tid);
+			r = vgpu_run_warp(v, sub, cs, tid);
+			if (r != VGPU_SCHED_DONE)
+				goto out;	/* paused mid-grid */
 			if (sub->error)
-				return;
+				break;		/* bad instruction: stop */
 			v->cs_warps++;
 			v->cs_threads += VGPU_WARP;
+			cs->warp++;
 		}
-		v->cs_blocks++;
+		if (sub->error)
+			break;
+		cs->warp = 0;
+		cs->block++;
+		{
+			unsigned long flags;
+
+			spin_lock_irqsave(&v->lock, flags);
+			v->cs_blocks++;
+			sub->q->cs_blocks++;
+			spin_unlock_irqrestore(&v->lock, flags);
+		}
+		cs->slice_blocks++;
+		udelay(VGPU_BLOCK_US);
 	}
 
-	kfree(fw);
-	v->cs_kernels_launched++;
-	v->cs_waves += DIV_ROUND_UP(sub->grid * sub->block,
-				    VGPU_SM_COUNT * VGPU_MAX_THREADS_SM);
+	if (!sub->error) {
+		/* the whole grid retired */
+		v->cs_kernels_launched++;
+		v->cs_waves += DIV_ROUND_UP((u64)sub->grid * sub->block,
+					    VGPU_SM_COUNT * VGPU_MAX_THREADS_SM);
+		{
+			unsigned long flags;
+
+			spin_lock_irqsave(&v->lock, flags);
+			sub->q->cs_launches++;
+			spin_unlock_irqrestore(&v->lock, flags);
+		}
+		kfree(cs->fw);
+		cs->fw = NULL;
+	}
+	r = VGPU_SCHED_DONE;
+
+out:
+	vgpu_launch_account(v, sub, cs->start_ns);
+	return r;
 }

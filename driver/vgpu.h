@@ -30,6 +30,14 @@
 #define VGPU_SCRATCH_SIZE	(16 * 1024)	/* command fetch area */
 #define VGPU_FENCE_TIMEOUT	(10 * HZ)	/* hang-detection backstop */
 
+/*
+ * The SIMT geometry (phase D). Both live here, not in vgpu_compute.c,
+ * because phase F's context switch saves a warp's register file and
+ * that struct is part of struct vgpu_submission.
+ */
+#define VGPU_WARP		32	/* lanes per warp */
+#define VGPU_NREGS		16	/* registers per thread */
+
 /* virtual BAR0: the MMIO register file (coherent DMA) */
 struct vgpu_regs {
 	u32 status;
@@ -49,6 +57,54 @@ struct vgpu_fence {
 	spinlock_t lock;
 	u32 seqno;
 	unsigned long created_jiffies;	/* for the watchdog */
+};
+
+/*
+ * What the scheduler decided at the last safe point of a run (phase F).
+ * VGPU_SCHED_DONE doubles as "no yield requested" — the check runs at
+ * every instruction boundary and the executor only stops on the other
+ * two.
+ */
+enum vgpu_sched {
+	VGPU_SCHED_DONE = 0,	/* run on / the submission finished */
+	VGPU_SCHED_TIMESLICE,	/* this slice is spent: round-robin yield */
+	VGPU_SCHED_PREEMPT,	/* a higher-priority context is waiting */
+};
+
+/*
+ * One warp's register file: 32 lanes x 16 registers plus the per-lane
+ * EXIT mask. This is what a context switch saves and restores — the
+ * driver-side analogue of the wavefront state a real driver writes into
+ * the context's MQD before it can let another channel run.
+ */
+struct vgpu_warp_frame {
+	u32 regs[VGPU_WARP][VGPU_NREGS];
+	bool done[VGPU_WARP];
+};
+
+/*
+ * The resumable state of an in-flight kernel launch (phase F).
+ *
+ * A launch no longer runs to completion inside one work item: it can be
+ * paused at any instruction boundary and resumed later, possibly after
+ * another context's kernel has run in between. Everything needed to
+ * continue is here:
+ *   block / warp  which block and warp the engine is dispatching
+ *   pc / resuming the instruction to resume at, and whether the
+ *                 register file holds a partially executed warp
+ *   slice_blocks  blocks executed since the launch last had the engine
+ *                 (the timeslice accounting)
+ *   fw            the saved register file, NULL once the grid retired
+ */
+struct vgpu_launch {
+	u32 block;
+	u32 warp;
+	u32 pc;
+	bool started;		/* the register file is allocated */
+	bool resuming;		/* warp+pc hold live state: resume mid-warp */
+	u32 slice_blocks;	/* blocks executed since the last switch */
+	u64 start_ns;		/* when this slice of execution began */
+	struct vgpu_warp_frame *fw;
 };
 
 /*
@@ -123,6 +179,15 @@ struct vgpu_submission {
 	struct drm_gem_object *args_obj;	/* the argument buffer (pinned) */
 	u32 args_off;
 	u32 grid, block;
+	/*
+	 * phase F: the resumable launch state (NULL unless this submission
+	 * carries a LAUNCH). While a launch is paused it stays on the
+	 * in_flight list — its fence is NOT signaled, its ring bytes and
+	 * its pinned argument buffer stay claimed — and cs carries the
+	 * saved cursor the engine resumes from.
+	 */
+	struct vgpu_launch *cs;
+	u32 cmd_idx;		/* next command to execute (the scheduler PC) */
 
 	/*
 	 * Phase G: the semaphore page (pinned for this submission, like
@@ -135,6 +200,15 @@ struct vgpu_submission {
 	u32 *order;				/* topological node order */
 	u32 ngnodes;
 	bool is_graph;
+	/*
+	 * Which node of order[] the graph resumes at. Phase F made a
+	 * LAUNCH resumable: a graph's launch node can be paused mid-grid
+	 * and the engine re-picks the submission later, so the graph has
+	 * to re-enter at the node it stopped inside — not back at node 0
+	 * (which would re-run the copy-in and, worse, run the copy-out
+	 * before the launch has written its output).
+	 */
+	u32 gnode_idx;
 };
 
 /*
@@ -167,6 +241,15 @@ struct vgpu_queue {
 	u32 get, put;
 	u64 fence_context;		/* one timeline per queue */
 	u64 stats_submitted, stats_completed, stats_errors;
+
+	/*
+	 * phase F: per-context compute accounting (debugfs "compute").
+	 * This is the driver-side source of what an nvidia-smi-alike
+	 * shows per process: how much engine time this context burned,
+	 * and how often it was bounced off the engine.
+	 */
+	u64 cs_launches, cs_blocks, cs_time_ns;
+	u64 cs_switches, cs_preempted;
 
 	/* in-order: the last seqno handed out on this queue */
 	u32 tail_seqno;
@@ -267,10 +350,19 @@ struct vgpu {
 	u64 cs_coalesced_warps, cs_bcast_warps, cs_uncoalesced_warps;
 	u64 cs_mem_lat_ns;		/* modelled memory latency, ns */
 	struct list_head kernel_list;	/* every live kernel (debugfs) */
+
+	/*
+	 * phase F: the scheduler's counters. cs_ctx_switches counts
+	 * every time an engine gave its pipe up at a safe point;
+	 * cs_preemptions / cs_timeslices split that by reason.
+	 */
+	u64 cs_ctx_switches, cs_preemptions, cs_timeslices;
 };
 
 #define to_vgpu(drm_dev) container_of(drm_dev, struct vgpu, dev)
 
+/* phase D's SM geometry lives in vgpu_compute.c; the warp register
+ * file above needs these two at struct-definition time. */
 #define VGPU_NREGS_MAX		16
 
 /* how long the engine stalls on a WAIT_TIMELINE before giving up */
@@ -281,7 +373,7 @@ struct vgpu {
 
 /* vgpu_compute.c */
 struct vgpu_instr;
-void vgpu_compute_run(struct vgpu *v, struct vgpu_submission *sub);
+enum vgpu_sched vgpu_compute_run(struct vgpu *v, struct vgpu_submission *sub);
 
 /* vgpu_drv.c: BLIT resolution, shared by the doorbell and the graph */
 struct vgpu_queue *vgpu_queue_find(struct vgpu_file *vf, u32 qid);
@@ -301,7 +393,15 @@ int vgpu_timeline_resolve(struct drm_file *file, struct vgpu_submission *sub,
 			  u32 sem_bo, u32 sem_off);
 void vgpu_sync_exec_cmd(struct vgpu *v, struct vgpu_submission *sub,
 			u32 op, u32 sem_off, u64 val);
-void vgpu_graph_execute(struct vgpu *v, struct vgpu_submission *sub);
+/*
+ * Walk the graph's nodes in topological order. Returns VGPU_SCHED_DONE
+ * when the whole DAG retired; otherwise the reason a LAUNCH node was
+ * paused, with sub->gnode_idx left at that node so the next entry
+ * resumes it (phase F's scheduler). The submission must NOT be
+ * completed in that case: no fence, no release of gnodes.
+ */
+enum vgpu_sched vgpu_graph_execute(struct vgpu *v,
+				   struct vgpu_submission *sub);
 void vgpu_sync_release(struct vgpu *v, struct vgpu_submission *sub);
 u32 vgpu_bo_word(struct drm_gem_object *obj, u32 word, bool write, u32 val);
 
@@ -313,4 +413,6 @@ irqreturn_t vgpu_irq_handler(int irq, void *dev_id);
 void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub);
 void vgpu_blit_pages(struct vgpu *v, struct page **src_pages,
 		     struct page **dst_pages, u32 npages);
+/* the cooperative yield point a running launch polls (phase F) */
+enum vgpu_sched vgpu_sched_check(struct vgpu *v, struct vgpu_submission *sub);
 #endif /* _VGPU_DRV_H_ */

@@ -481,6 +481,21 @@ int vgpu_graph_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 					      &sub->gnodes[n]);
 		if (ret)
 			goto out_free_sub;
+		/*
+		 * Phase F made a launch resumable, and the state that
+		 * makes it so (the block/warp/pc cursor and the saved
+		 * register file) lives in sub->cs. The doorbell allocates
+		 * it when it resolves a LAUNCH packet; a graph carrying a
+		 * LAUNCH node must do the same, because
+		 * vgpu_compute_run() dereferences sub->cs immediately.
+		 */
+		if (nodes[n].type == VGPU_PKT_LAUNCH && !sub->cs) {
+			sub->cs = kzalloc(sizeof(*sub->cs), GFP_KERNEL);
+			if (!sub->cs) {
+				ret = -ENOMEM;
+				goto out_free_sub;
+			}
+		}
 		/* and the semaphore page, once per graph */
 		if (vgpu_pkt_is_sync(nodes[n].type)) {
 			ret = vgpu_timeline_resolve(file, sub,
@@ -490,6 +505,8 @@ int vgpu_graph_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 				goto out_free_sub;
 		}
 	}
+
+	sub->gnode_idx = 0;	/* the DAG starts at its first node */
 
 	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
 	if (!fence) {
@@ -548,7 +565,14 @@ int vgpu_graph_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 	return 0;
 
 out_free_sub:
+	/*
+	 * vgpu_sync_release() owns the per-node resources and clears the
+	 * launch fields the graph borrowed; the resumable launch state
+	 * (allocated above for a LAUNCH node) is the submission's own,
+	 * so it goes here — nothing has been published to the engine yet.
+	 */
 	vgpu_sync_release(v, sub);
+	kfree(sub->cs);
 	kfree(sub);
 out:
 	kfree(nodes);
@@ -563,12 +587,21 @@ out:
  * waits are needed inside the graph, which is exactly why the DAG is
  * free to express "these two are independent" (they simply appear in
  * either order) and "this one must follow that one".
+ *
+ * Resumable (phase F): the walk starts at sub->gnode_idx, so a graph
+ * that was paused inside a LAUNCH node re-enters at that node rather
+ * than back at node 0. Re-running node 0 would repeat the copy-in, but
+ * the real damage would be one node further on: the copy-out would run
+ * against a launch that has not finished writing its output, which is
+ * exactly the data hazard the DAG's edges exist to prevent. A pause
+ * therefore returns the scheduler's verdict and the caller leaves the
+ * submission (and its gnodes) alone.
  */
-void vgpu_graph_execute(struct vgpu *v, struct vgpu_submission *sub)
+enum vgpu_sched vgpu_graph_execute(struct vgpu *v, struct vgpu_submission *sub)
 {
 	u32 i;
 
-	for (i = 0; i < sub->ngnodes; i++) {
+	for (i = sub->gnode_idx; i < sub->ngnodes; i++) {
 		struct vgpu_gnode *gn = &sub->gnodes[sub->order[i]];
 
 		switch (gn->type) {
@@ -579,7 +612,9 @@ void vgpu_graph_execute(struct vgpu *v, struct vgpu_submission *sub)
 			vgpu_blit_pages(v, gn->blit.src_pages,
 					gn->blit.dst_pages, gn->blit.npages);
 			break;
-		case VGPU_PKT_LAUNCH:
+		case VGPU_PKT_LAUNCH: {
+			enum vgpu_sched r;
+
 			/*
 			 * vgpu_compute_run() reads the launch descriptor
 			 * out of the submission; a graph node supplies it.
@@ -590,8 +625,18 @@ void vgpu_graph_execute(struct vgpu *v, struct vgpu_submission *sub)
 			sub->args_off = gn->args_off;
 			sub->grid = gn->grid;
 			sub->block = gn->block;
-			vgpu_compute_run(v, sub);
+			r = vgpu_compute_run(v, sub);
+			if (r != VGPU_SCHED_DONE) {
+				/*
+				 * Paused mid-grid. Stay on this node so
+				 * the next entry resumes the launch
+				 * instead of advancing past it.
+				 */
+				sub->gnode_idx = i;
+				return r;
+			}
 			break;
+		}
 		case VGPU_PKT_SIGNAL_TIMELINE:
 		case VGPU_PKT_WAIT_TIMELINE:
 		case VGPU_PKT_WRITE_EVENT:
@@ -605,8 +650,21 @@ void vgpu_graph_execute(struct vgpu *v, struct vgpu_submission *sub)
 		if (sub->error)
 			break;	/* "GPU fault: stop the graph" */
 	}
+
+	/*
+	 * Only on the way out whole: a paused graph must not claim it is
+	 * done, and the caller (the engine loop) is what reports "done"
+	 * for everything else.
+	 */
+	if (sub->error) {
+		dev_info(&v->pdev->dev,
+			 "[vgpu:engine] seq#%u (engine %u) graph done (%u nodes) ERROR\n",
+			 sub->seqno, sub->engine, sub->ngnodes);
+		return VGPU_SCHED_DONE;
+	}
+	sub->gnode_idx = sub->ngnodes;
 	dev_info(&v->pdev->dev,
-		 "[vgpu:engine] seq#%u (engine %u) graph done (%u nodes)%s\n",
-		 sub->seqno, sub->engine, sub->ngnodes,
-		 sub->error ? " ERROR" : "");
+		 "[vgpu:engine] seq#%u (engine %u) graph done (%u nodes)\n",
+		 sub->seqno, sub->engine, sub->ngnodes);
+	return VGPU_SCHED_DONE;
 }

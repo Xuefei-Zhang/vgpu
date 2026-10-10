@@ -259,32 +259,48 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | A | 多引擎多队列（stream 语义） | ✅ 已完成并 guest 验证 | `1657cdc` |
 | B | 门铃 + 引擎侧取指（packet 提交） | ✅ 已完成并 guest 验证 | `8ebd16f` |
 | D | 计算语义：kernel launch / warp 执行 / 合并率 | ✅ 已完成并 guest 验证 | `f6b9b0c` |
-| G | 内存语义同步：timeline semaphore / event / 图提交 | ✅ 已完成并 guest 验证 | `b9f0789` |
-| C, E–J | 见上表 | ⬜ 待开发 | — |
+| F | 抢占与时间片（可恢复执行 + 高优先级抢占） | ✅ 已完成并 guest 验证 | `74e5142` |
+| J | vgpu-smi-lite 观测工具 | ✅ 已完成并 guest 验证 | `a71f6ba` |
+| G | timeline semaphore / event / 图提交 | ✅ 已完成并 guest 验证（含 F×G 合并后完整 autorun） | 分支 phase/g-sync：`b9f0789`+`f39bfad`+（本次修复） |
+| C | VMID/VA/页表/显存管理 | 🟡 半成品，编译不过（WIP） | `8e9b84c`（分支 phase/c-vm） |
+| I | RPM/DVFS/计费 | 🟡 半成品，编译不过（WIP） | `ce4e414`（分支 phase/i-power） |
+| E, H | UVM 迁移 / fault containment | ⬜ 未开始（依赖 C） | — |
 
 **已交付内容**：per-fd 多队列（每队列独立 ring + fence timeline + doorbell）、三个引擎（gfx/copy/compute）各自
 ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、7 指令教学 ISA +
 warp 同步执行器 + LAUNCH packet + MODULE_LOAD 模块注册 + broadcast/coalesced/strided 三类访存统计、
 debugfs `queues`/`compute` 视图、`-q`/`-p`/saxpy 测试与 autorun 集成。
-**同步（Phase G）**：VGPU_SEM_BIND 装订 per-fd semaphore page；SIGNAL/WAIT_TIMELINE 与 WRITE_EVENT 包
-直接在"CPU 可 poll 的内存"上写/等；VGPU_GRAPH 一次 doorbell 提交整张 DAG（ioctl 内拓扑排序）；
-debugfs `sync` 视图。用户态 `-g` 模式**全程不调 VGPU_WAIT**：poll mmap 等到 timeline 值，
-4 节点图（copy-in → launch → copy-out → signal，索引序 ≠ 依赖序，靠数据依赖证明执行序）
-与等价 4 次独立 doorbell 用 `submitted` 计数器对比（1 vs 4）。
 **实例**：`userspace/examples/saxpy.c`——CUDA SAXPY 的 vgpu 对应实现，4096 元素全对；
 入门/测试/trace/实例教学见 `docs/GETTING-STARTED.md`。
 
-**过程中抓到并修复的 5 个真 bug**（都有 guest 证据，写入各自 commit message）：
+**过程中抓到并修复的 4 个真 bug**（都有 guest 证据，写入各自 commit message）：
 1. 自旋锁内调可睡眠 API（`drm_gem_shmem_pin` 的页分配 + `set_pages_array`）
 2. `container_of` 数组元素陷阱：减了数组基址偏移导致 engine 1/2 的设备指针错位
 3. 设备级 scratch 水位按**完成序**回收——多引擎并发才暴露的分配/回收乱序
 4. **三种尺寸混淆**：ring 槽 64B / command 结构 48B / packet 40B，混用导致 scratch 水位下溢 48B/批
-5. **blit 页数组二次加偏移**：pin 时数组就是区间本身，`vgpu_blit_pages`/`vgpu_blit_unref`
-   又加了一次 `blit_off`——offset 0 时看不见，Phase G 的 graph COPY 节点第一次踩到
-   （KASAN slab-out-of-bounds → memcpy 踩野 page → GPF panic，guest 全日志可见）
 
-**下一步建议**：C（VMID/VA/页表+显存管理）与 A/B/D 无依赖，`~/self/wt/c` 工作树已就绪；
-E（UVM 迁移）依赖 C+D；F（抢占）依赖 D；H（fault containment）依赖 C+D；I（功耗/DVFS）依赖 D。
+**下一步建议**（按性价比排序）：
+1. **G 收尾**：分支 `phase/g-sync` 的驱动已就绪，只差 `vgpu_test -g`（semaphore 轮询 + 多节点图）与 autorun 接线——一小时的工作量。
+2. **C 修复**：分支 `phase/c-vm` 只有 3 个编译错误（`vgpu_vm_unmap_range` 签名不一致 ×2 + 一处 static 冲突），修完即按验收标准跑 VMID 隔离与驱逐实验。
+3. **I 续作**：分支 `phase/i-power` 需先读懂代理人留下的 `vgpu_lat_ns`/`VGPU_MEM_LAT_BASE` 改名意图，再完成 DVFS 缩放与 rpm 唤醒测量。
+4. **E/H**：依赖 C 落地。
+**F×G 集成的断点（已修复）**：把 phase/g-sync 合入 main（F+J 之上）后，guest 在 `-g` 阶段崩：
+`KASAN: null-ptr-deref`，栈上是 `vgpu_compute_run`（但 caller 帧显示为 `vgpu_blit_pages`——那是前一帧的残留
+污点，真正的 RIP 在 `vgpu_compute_run+0xa2`，读 `sub->cs->started` 时 `sub->cs` 为 NULL）。
+**根因不是 state 残留而是结构性遗漏**：phase F 把 launch 改成可恢复执行后，游标 `sub->cs` 由 doorbell
+侧分配（`vgpu_drv.c` 的 LAUNCH packet 分支），而 phase G 的 GRAPH ioctl 走自己那条解析路径，**从未分配
+`sub->cs`**。`vgpu_graph_execute()` 的 LAUNCH 节点把 continuity 借给 `vgpu_compute_run()` 用，于是
+`cs->block`/`cs->started` 直接踩 NULL——图里只要有一个 launch 节点就必崩，与别的阶段是否先跑无关
+（实验证据：只 `insmod` + 只跑 `/root/vgpu_test -g`，同样崩）。
+已排除：`vgpu_sync.c`/图路径代码与绿分支零差异、用户态测试与绿分支逐字一致、blit 页数组/偏移无问题
+（那几个 COPY 节点在崩之前都正确执行完了）。
+**同时修的两处**：① 图里的 launch 节点不再在"暂停"后闷头往下走——`vgpu_graph_execute()` 现在返回调度判决，
+`sub->gnode_idx` 记住停下的那个节点，引擎重入时从那里继续（否则 copy-out 会读到半个 launch 的输出，
+这是 DAG 边本来要防的数据冒险）；② 顺带清掉 `vgpu_sync_release()` 清空 `sub->args_obj` 之后
+`vgpu_finish_submission()` 里那段死代码的所有权混淆（注释写清"谁释放谁"，graph 路径由 sync_release
+逐节点释放，doorbell 路径由 generic 段释放，两者永不重叠）。
+
+教训：并行代理全部被 provider 速率限制打断——它们都写了大量代码但都没跑完验证；上面每个 WIP commit 都记录了断点。
 
 ## 10. 里程碑总览
 

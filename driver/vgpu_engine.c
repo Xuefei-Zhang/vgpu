@@ -186,20 +186,34 @@ static void vgpu_fetch_packets(struct vgpu *v, struct vgpu_submission *sub)
 	kunmap_local(pk);
 }
 
-static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
+/*
+ * Execute one submission — or one slice of it (phase F).
+ *
+ * Returns VGPU_SCHED_DONE when the submission finished; otherwise the
+ * scheduler's reason for pausing, and sub->cmd_idx is left pointing at
+ * the command to resume at (a LAUNCH saves its own finer-grained
+ * cursor in sub->cs). The caller must not complete the submission in
+ * that case: the fence stays unsignaled and the submission stays on
+ * the run queue, state and all.
+ */
+static enum vgpu_sched vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 {
-
 	struct vgpu_cmd *cmds =
 		(struct vgpu_cmd *)(v->scratch[sub->engine] + sub->cmds_off);
 	u32 i;
 
 	/* VGPU_GRAPH: nodes were resolved and ordered by the ioctl */
-	if (sub->gnodes) {
-		vgpu_graph_execute(v, sub);
-		return;
-	}
+	if (sub->gnodes)
+		/*
+		 * The graph is resumable now (phase F): a launch node
+		 * inside it can be paused, in which case the graph
+		 * reports where it stopped and this function passes
+		 * the verdict on to the engine loop instead of
+		 * completing the submission.
+		 */
+		return vgpu_graph_execute(v, sub);
 
-	for (i = 0; i < sub->ncmds; i++) {
+	for (i = sub->cmd_idx; i < sub->ncmds; i++) {
 		struct vgpu_cmd *c = &cmds[i];
 
 		switch (c->opcode) {
@@ -224,8 +238,25 @@ static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 			}
 			vgpu_blit(v, sub);
 			break;
-		case VGPU_OP_LAUNCH:
-			vgpu_compute_run(v, sub);
+		case VGPU_OP_LAUNCH: {
+			enum vgpu_sched r;
+
+			/*
+			 * Only the doorbell path resolves a launch (the
+			 * legacy CS command has no kernel descriptor),
+			 * so a launch without a submission-side state is
+			 * a malformed command, not something to decode.
+			 */
+			if (!sub->cs) {
+				if (!sub->error)
+					sub->error = -EINVAL;
+				break;
+			}
+			r = vgpu_compute_run(v, sub);
+			if (r != VGPU_SCHED_DONE) {
+				sub->cmd_idx = i;	/* resume here */
+				return r;
+			}
 			break;
 		/*
 		 * Phase G: the stream can keep going after a signal — a
@@ -238,6 +269,7 @@ static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 			vgpu_sync_exec_cmd(v, sub, c->opcode, c->set_off,
 					   c->set_data);
 			break;
+		}
 		default:
 			if (!sub->error)
 				sub->error = -EINVAL;
@@ -245,10 +277,8 @@ static void vgpu_execute(struct vgpu *v, struct vgpu_submission *sub)
 		if (sub->error)
 			break;	/* "GPU fault: stop the submission" */
 	}
-	dev_info(&v->pdev->dev,
-		 "[vgpu:engine] seq#%u (engine %u) done (%u cmds)%s\n",
-		 sub->seqno, sub->engine, sub->ncmds,
-		 sub->error ? " ERROR" : "");
+	sub->cmd_idx = sub->ncmds;
+	return VGPU_SCHED_DONE;
 }
 
 static void vgpu_engine_work(struct work_struct *work, int engine);
@@ -276,6 +306,131 @@ static const vgpu_engine_work_fn engine_work_fns[VGPU_ENGINE_COUNT] = {
 	vgpu_engine_work_compute,
 };
 
+/* the blocks per timeslice on the compute engine (phase F) */
+#define VGPU_TIMESLICE_BLOCKS	32
+
+/*
+ * The cooperative yield point (phase F).
+ *
+ * A running launch polls this at every instruction boundary — the
+ * "safe points" a real GPU's scheduler gets, because unlike a CPU there
+ * is no wire anyone can pull to make a shader stop mid-instruction:
+ * preemption has to be cooperative.
+ *
+ * Two reasons to give the engine up:
+ *   TIMESLICE — this launch has executed its share of blocks, so it
+ *              goes to the BACK of its priority class and another
+ *              context gets the pipe (that is the timeslice).
+ *   PREEMPT   — a strictly higher-priority context has work waiting on
+ *              this engine. The launch pauses at this instruction
+ *              boundary and keeps its place in its own class, ahead of
+ *              same-priority backlog.
+ *
+ * Never reports PREEMPT unless a strictly higher submission really is
+ * waiting, so the engine always makes progress when it re-picks.
+ */
+enum vgpu_sched vgpu_sched_check(struct vgpu *v, struct vgpu_submission *sub)
+{
+	struct vgpu_launch *cs = sub->cs;
+	struct vgpu_submission *pos;
+	enum vgpu_sched r = VGPU_SCHED_DONE;
+	unsigned long flags;
+
+	/*
+	 * Preemption is checked BEFORE the timeslice on purpose: it is
+	 * the urgent condition (a context is waiting), and reporting a
+	 * coincidentally expired timeslice instead would hide a real
+	 * preemption from the counters.
+	 *
+	 * Cheap lockless pre-filter: when nothing else is queued on this
+	 * engine there is nobody to preempt us. list_empty_careful() is
+	 * the lockless-readable form; at worst we notice one instruction
+	 * later than a locked check would have.
+	 */
+	if (!list_empty_careful(&v->engine_pending[sub->engine])) {
+		spin_lock_irqsave(&v->lock, flags);
+		list_for_each_entry(pos, &v->engine_pending[sub->engine],
+				    node) {
+			if (pos->q->prio > sub->q->prio) {
+				r = VGPU_SCHED_PREEMPT;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&v->lock, flags);
+		if (r != VGPU_SCHED_DONE)
+			return r;
+	}
+
+	/* the timeslice: this engine context owns the launch's counters */
+	if (cs->slice_blocks >= VGPU_TIMESLICE_BLOCKS) {
+		cs->slice_blocks = 0;
+		return VGPU_SCHED_TIMESLICE;
+	}
+	return VGPU_SCHED_DONE;
+}
+
+/*
+ * A context switch: the engine is handing its pipe from one context's
+ * launch to another's work. Nothing completes — the fence stays
+ * unsignaled, the ring bytes and the pinned argument buffer stay
+ * claimed, and the launch's resume point lives in sub->cs. That is
+ * exactly the state a real driver saves into the channel's MQD before
+ * it can let a higher-priority channel run.
+ *
+ * Where the victim goes back on the run queue is the whole point of
+ * the split: a preempted launch keeps its place (head of its class, so
+ * it resumes as soon as the higher-priority work retires), while a
+ * timesliced one goes to the tail so the other contexts get their turn.
+ */
+static void vgpu_ctx_switch(struct vgpu *v, struct vgpu_submission *sub,
+			    enum vgpu_sched why)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&v->lock, flags);
+	v->cs_ctx_switches++;
+	sub->q->cs_switches++;
+	if (why == VGPU_SCHED_PREEMPT) {
+		v->cs_preemptions++;
+		sub->q->cs_preempted++;
+		list_move(&sub->node, &v->engine_pending[sub->engine]);
+	} else {
+		v->cs_timeslices++;
+		list_move_tail(&sub->node, &v->engine_pending[sub->engine]);
+	}
+	spin_unlock_irqrestore(&v->lock, flags);
+
+	dev_info(&v->pdev->dev,
+		 "[vgpu:sched] %s: seq#%u q#%u prio=%u yields at block %u/%u warp %u pc %u (switches %llu)\n",
+		 why == VGPU_SCHED_PREEMPT ? "preempt" : "timeslice",
+		 sub->seqno, sub->q->qid, sub->q->prio, sub->cs->block,
+		 sub->grid, sub->cs->warp, sub->cs->pc, v->cs_ctx_switches);
+}
+
+/*
+ * Pick the next submission to run on an engine: the first one in the
+ * highest priority class waiting (phase F's scheduler). Strict ">"
+ * keeps FIFO order inside a class, and since every submission of one
+ * queue shares that queue's priority, in-order execution per queue —
+ * the contract userspace depends on — is untouched. Cross-queue
+ * reordering is precisely what priority classes are for.
+ */
+static struct vgpu_submission *vgpu_engine_next(struct vgpu *v, int engine)
+{
+	struct vgpu_submission *sub, *best = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&v->lock, flags);
+	list_for_each_entry(sub, &v->engine_pending[engine], node) {
+		if (!best || sub->q->prio > best->q->prio)
+			best = sub;
+	}
+	if (best)
+		list_move_tail(&best->node, &v->in_flight);
+	spin_unlock_irqrestore(&v->lock, flags);
+	return best;
+}
+
 /*
  * The engine body. NOTE how the container is recovered: the index is
  * part of the member name (engine_work[engine]), because container_of()
@@ -288,6 +443,11 @@ static const vgpu_engine_work_fn engine_work_fns[VGPU_ENGINE_COUNT] = {
  * magic" + KASAN slab-out-of-bounds 40 bytes right of a
  * sizeof(struct vgpu_queue) region). One wrapper per engine, each
  * naming its own index, is what real drivers do.
+ *
+ * The loop is also phase F's scheduler: it does not drain one
+ * submission at a time any more, it runs each one until a safe point
+ * yields, then re-picks. A submission that yielded is still on the run
+ * queue with its state saved, so "re-pick" is what resumes it.
  */
 static void vgpu_engine_work(struct work_struct *work, int engine)
 {
@@ -295,27 +455,35 @@ static void vgpu_engine_work(struct work_struct *work, int engine)
 	struct vgpu_submission *sub;
 
 	for (;;) {
-		unsigned long flags;
+		enum vgpu_sched r;
 
-		spin_lock_irqsave(&v->lock, flags);
-		sub = list_first_entry_or_null(&v->engine_pending[engine],
-					       struct vgpu_submission, node);
-		if (sub)
-			list_move_tail(&sub->node, &v->in_flight);
-		spin_unlock_irqrestore(&v->lock, flags);
+		sub = vgpu_engine_next(v, engine);
 		if (!sub)
 			break;
 
 		/*
 		 * Packet submissions carry a ring range, not commands:
-		 * the fetch happens here, in engine context.
+		 * the fetch happens here, in engine context. Only the
+		 * first slice fetches — a paused launch keeps its
+		 * decoded commands (and its scratch claim) across the
+		 * context switch.
 		 */
 		if (sub->npkts) {
 			vgpu_fetch_packets(v, sub);
 			sub->ncmds = sub->npkts;
 			sub->npkts = 0;
 		}
-		vgpu_execute(v, sub);
+
+		r = vgpu_execute(v, sub);
+		if (r != VGPU_SCHED_DONE) {
+			vgpu_ctx_switch(v, sub, r);
+			continue;	/* let the scheduler pick the next */
+		}
+
+		dev_info(&v->pdev->dev,
+			 "[vgpu:engine] seq#%u (engine %u) done (%u cmds)%s\n",
+			 sub->seqno, sub->engine, sub->ncmds,
+			 sub->error ? " ERROR" : "");
 
 		/*
 		 * "Hardware" completion: the device writes the status
@@ -399,6 +567,10 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 	 * node), and the semaphore page is pinned per submission. Both
 	 * are released (and the pointers cleared) here, so the generic
 	 * BLIT/launch cleanup below only ever sees what it resolved.
+	 * It also clears sub->args_obj, which for a graph is the node's
+	 * argument buffer and was already released per node — the release
+	 * below is therefore live only on the doorbell path, and the two
+	 * can never double-free.
 	 */
 	vgpu_sync_release(v, sub);
 
@@ -410,6 +582,16 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 	}
 	/* release the BLIT's pages + pins (doorbell path) */
 	vgpu_blit_unref(v, &sub->blit);
+	/*
+	 * The saved launch state goes with it. A launch that was paused
+	 * mid-grid still owns its register file here — the drain path
+	 * (rmmod) and the fence path both come through here.
+	 */
+	if (sub->cs) {
+		kfree(sub->cs->fw);
+		kfree(sub->cs);
+		sub->cs = NULL;
+	}
 
 	mutex_lock(&v->fence_mutex);
 	fence = idr_find(&v->fence_idr, sub->seqno);

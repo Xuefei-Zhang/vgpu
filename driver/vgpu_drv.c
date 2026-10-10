@@ -150,7 +150,10 @@ DEFINE_SHOW_ATTRIBUTE(vgpu_dbg_queues);
 static int vgpu_dbg_compute_show(struct seq_file *s, void *unused)
 {
 	struct vgpu *v = s->private;
+	struct vgpu_queue *q;
+	unsigned long flags;
 
+	spin_lock_irqsave(&v->lock, flags);
 	seq_printf(s, "kernels   %llu\n", v->cs_kernels_launched);
 	seq_printf(s, "blocks    %llu\n", v->cs_blocks);
 	seq_printf(s, "warps     %llu\n", v->cs_warps);
@@ -179,6 +182,27 @@ static int vgpu_dbg_compute_show(struct seq_file *s, void *unused)
 	seq_printf(s, "strided warps      %llu / %llu\n",
 		   v->cs_uncoalesced_warps, v->cs_warps);
 	seq_printf(s, "modelled mem latency %llu ns\n", v->cs_mem_lat_ns);
+
+	/*
+	 * phase F: the scheduler's view of the compute engine. ctx
+	 * switches is every hand-off at a safe point; preemptions /
+	 * timeslices say why. Interleaving between two long launches
+	 * shows up as ctx switches > 0.
+	 */
+	seq_printf(s, "ctx switches %llu\n", v->cs_ctx_switches);
+	seq_printf(s, "preemptions  %llu\n", v->cs_preemptions);
+	seq_printf(s, "timeslices   %llu\n", v->cs_timeslices);
+	seq_puts(s, "per-context compute (q engine prio launches blocks ms preempted switches)\n");
+	list_for_each_entry(q, &v->queue_list, dev_node) {
+		if (q->engine != VGPU_ENGINE_COMPUTE)
+			continue;
+		seq_printf(s, "q#%u %s prio=%u launches=%llu blocks=%llu %llu ms preempted=%llu switches=%llu\n",
+			   q->qid, vgpu_engine_names[q->engine], q->prio,
+			   q->cs_launches, q->cs_blocks,
+			   q->cs_time_ns / 1000000, q->cs_preempted,
+			   q->cs_switches);
+	}
+	spin_unlock_irqrestore(&v->lock, flags);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(vgpu_dbg_compute);
@@ -221,6 +245,13 @@ static int vgpu_dbg_pending_show(struct seq_file *s, void *unused)
 			seq_printf(s, "pending   seq#%u ncmds=%u engine=%s\n",
 				   sub->seqno, sub->ncmds,
 				   vgpu_engine_names[i]);
+			if (sub->cs)
+				seq_printf(s,
+					   "  launch  seq#%u at block %u/%u warp %u pc %u%s",
+					   sub->seqno, sub->cs->block,
+					   sub->grid, sub->cs->warp,
+					   sub->cs->pc,
+					   sub->cs->resuming ? " (mid-warp)\n" : "\n");
 			any = true;
 		}
 	}
@@ -228,6 +259,12 @@ static int vgpu_dbg_pending_show(struct seq_file *s, void *unused)
 		seq_printf(s, "in-flight seq#%u ncmds=%u err=%d%s\n",
 			   sub->seqno, sub->ncmds, (int)sub->error,
 			   sub->is_graph ? " graph" : "");
+		if (sub->cs)
+			seq_printf(s,
+				   "  launch  seq#%u at block %u/%u warp %u pc %u%s",
+				   sub->seqno, sub->cs->block, sub->grid,
+				   sub->cs->warp, sub->cs->pc,
+				   sub->cs->resuming ? " (mid-warp)\n" : "\n");
 		any = true;
 	}
 	spin_unlock_irqrestore(&v->lock, flags);
@@ -1219,6 +1256,17 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 			sub->grid = p->launch.grid;
 			sub->block = p->launch.block;
 			sub->args_off = p->launch.args_off;
+			/*
+			 * The launch's resumable state (phase F): a launch
+			 * may be paused mid-grid and resumed after other
+			 * contexts have run, so the submission itself owns
+			 * the cursor and the saved register file.
+			 */
+			sub->cs = kzalloc(sizeof(*sub->cs), GFP_KERNEL);
+			if (!sub->cs) {
+				ret = -ENOMEM;
+				goto err_unmap;
+			}
 			break;
 		}
 		/*
@@ -1347,6 +1395,7 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 		v->scratch_used[q->engine] -= bytes;
 		q->ring_used -= sub->ring_bytes;
 		spin_unlock_irqrestore(&v->lock, flags);
+		kfree(sub->cs);
 		kfree(sub);
 		return ret;
 	}
@@ -1364,6 +1413,7 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 err_free_fence:
 	kfree(fence);
 err_free_sub:
+	kfree(sub->cs);
 	kfree(sub);
 	return ret;
 err_unmap:
@@ -1377,7 +1427,9 @@ err_unmap:
 	if (sub->args_obj) {
 		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
 		drm_gem_object_put(sub->args_obj);
+		sub->args_obj = NULL;
 	}
+	kfree(sub->cs);		/* NULL-safe: no LAUNCH in a rejected batch */
 	kfree(sub);
 	return ret;
 }
