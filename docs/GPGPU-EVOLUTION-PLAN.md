@@ -261,7 +261,7 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | D | 计算语义：kernel launch / warp 执行 / 合并率 | ✅ 已完成并 guest 验证 | `f6b9b0c` |
 | F | 抢占与时间片（可恢复执行 + 高优先级抢占） | ✅ 已完成并 guest 验证 | `74e5142` |
 | J | vgpu-smi-lite 观测工具 | ✅ 已完成并 guest 验证 | `a71f6ba` |
-| G | timeline semaphore / event / 图提交 | ✅ 已完成并 guest 验证（含 F×G 合并后完整 autorun） | 分支 phase/g-sync：`b9f0789`+`f39bfad`+（本次修复） |
+| G | timeline semaphore / event / 图提交 | ✅ 已完成并入 main | `b19abbf` |
 | C | VMID/VA/页表/显存管理 | 🟡 半成品，编译不过（WIP） | `8e9b84c`（分支 phase/c-vm） |
 | I | RPM/DVFS/计费 | 🟡 半成品，编译不过（WIP） | `ce4e414`（分支 phase/i-power） |
 | E, H | UVM 迁移 / fault containment | ⬜ 未开始（依赖 C） | — |
@@ -284,7 +284,7 @@ debugfs `queues`/`compute` 视图、`-q`/`-p`/saxpy 测试与 autorun 集成。
 2. **C 修复**：分支 `phase/c-vm` 只有 3 个编译错误（`vgpu_vm_unmap_range` 签名不一致 ×2 + 一处 static 冲突），修完即按验收标准跑 VMID 隔离与驱逐实验。
 3. **I 续作**：分支 `phase/i-power` 需先读懂代理人留下的 `vgpu_lat_ns`/`VGPU_MEM_LAT_BASE` 改名意图，再完成 DVFS 缩放与 rpm 唤醒测量。
 4. **E/H**：依赖 C 落地。
-**F×G 集成的断点（已修复）**：把 phase/g-sync 合入 main（F+J 之上）后，guest 在 `-g` 阶段崩：
+**F×G 集成崩因（已修复，`b19abbf`）**：真正 RIP 在 `vgpu_compute_run` 解引用 `sub->cs`（NULL）——F 在 doorbell 路径分配可恢复游标，G 的 GRAPH ioctl 有自己的解析循环、从不分配它。第一版诊断被**旧栈帧**误导（trace 里残留的 `vgpu_blit_pages` 帧）。修复顺带把图做成可恢复的：launch 节点被暂停时记 `gnode_idx`，从断点重入，否则 copy-out 会在 launch 写出结果前跑（正是 DAG 边要防的数据危险）；恢复路径用 `TIMESLICE_BLOCKS=2` 强制三处 yield 验证。原记录：
 `KASAN: null-ptr-deref`，栈上是 `vgpu_compute_run`（但 caller 帧显示为 `vgpu_blit_pages`——那是前一帧的残留
 污点，真正的 RIP 在 `vgpu_compute_run+0xa2`，读 `sub->cs->started` 时 `sub->cs` 为 NULL）。
 **根因不是 state 残留而是结构性遗漏**：phase F 把 launch 改成可恢复执行后，游标 `sub->cs` 由 doorbell
