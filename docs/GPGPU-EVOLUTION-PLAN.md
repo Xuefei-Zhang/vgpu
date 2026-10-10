@@ -261,7 +261,7 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | D | 计算语义：kernel launch / warp 执行 / 合并率 | ✅ 已完成并 guest 验证 | `f6b9b0c` |
 | F | 抢占与时间片（可恢复执行 + 高优先级抢占） | ✅ 已完成并 guest 验证 | `74e5142` |
 | J | vgpu-smi-lite 观测工具 | ✅ 已完成并 guest 验证 | `a71f6ba` |
-| G | timeline semaphore / event / 图提交 | 🟡 驱动侧完成并验证；**用户态测试未写** | `5363b55`（分支 phase/g-sync） |
+| G | timeline semaphore / event / 图提交 | 🟡 **分支上完整验证通过**（驱动+用户态）；**并入 main 会崩** | 分支 phase/g-sync：`b9f0789`+`f39bfad` |
 | C | VMID/VA/页表/显存管理 | 🟡 半成品，编译不过（WIP） | `8e9b84c`（分支 phase/c-vm） |
 | I | RPM/DVFS/计费 | 🟡 半成品，编译不过（WIP） | `ce4e414`（分支 phase/i-power） |
 | E, H | UVM 迁移 / fault containment | ⬜ 未开始（依赖 C） | — |
@@ -284,6 +284,11 @@ debugfs `queues`/`compute` 视图、`-q`/`-p`/saxpy 测试与 autorun 集成。
 2. **C 修复**：分支 `phase/c-vm` 只有 3 个编译错误（`vgpu_vm_unmap_range` 签名不一致 ×2 + 一处 static 冲突），修完即按验收标准跑 VMID 隔离与驱逐实验。
 3. **I 续作**：分支 `phase/i-power` 需先读懂代理人留下的 `vgpu_lat_ns`/`VGPU_MEM_LAT_BASE` 改名意图，再完成 DVFS 缩放与 rpm 唤醒测量。
 4. **E/H**：依赖 C 落地。
+**F×G 集成的已知断点（下一个任务）**：把 phase/g-sync 合入 main（F+J 之上）后，guest 在 `-g` 阶段图的第一个 COPY 节点崩：
+`KASAN: null-ptr-deref` → `vgpu_blit_pages` ← `vgpu_graph_execute`。已排除：`vgpu_sync.c` 及图路径代码与绿分支**零差异**（diff 过）、用户态测试与绿分支**逐字一致**（比对过 nodes[] 初始化）。
+疑点按优先级：① F 的 `vgpu_ctx_switch`/重排队机制与图的 gnodes 生命周期的交互（ctx_switch 读 `sub->cs->...`，graph 提交时 `cs` 为 NULL）；② F 让 `vgpu_compute_run` 可暂停后，`vgpu_graph_execute` 未处理"图中途 yield"；③ 合并时 `vgpu_finish_submission` 里 `vgpu_sync_release` 清空 `sub->args_obj` 导致 generic finish 跳过 launch 参数释放（顺带发现的小泄漏，G 分支也有）。
+合并已回滚，main 保持 F+J 绿态。
+
 教训：并行代理全部被 provider 速率限制打断——它们都写了大量代码但都没跑完验证；上面每个 WIP commit 都记录了断点。
 
 ## 10. 里程碑总览
