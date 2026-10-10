@@ -259,7 +259,12 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | A | 多引擎多队列（stream 语义） | ✅ 已完成并 guest 验证 | `1657cdc` |
 | B | 门铃 + 引擎侧取指（packet 提交） | ✅ 已完成并 guest 验证 | `8ebd16f` |
 | D | 计算语义：kernel launch / warp 执行 / 合并率 | ✅ 已完成并 guest 验证 | `f6b9b0c` |
-| C, E–J | 见上表 | ⬜ 待开发 | — |
+| F | 抢占与时间片（可恢复执行 + 高优先级抢占） | ✅ 已完成并 guest 验证 | `74e5142` |
+| J | vgpu-smi-lite 观测工具 | ✅ 已完成并 guest 验证 | `a71f6ba` |
+| G | timeline semaphore / event / 图提交 | 🟡 驱动侧完成并验证；**用户态测试未写** | `5363b55`（分支 phase/g-sync） |
+| C | VMID/VA/页表/显存管理 | 🟡 半成品，编译不过（WIP） | `8e9b84c`（分支 phase/c-vm） |
+| I | RPM/DVFS/计费 | 🟡 半成品，编译不过（WIP） | `ce4e414`（分支 phase/i-power） |
+| E, H | UVM 迁移 / fault containment | ⬜ 未开始（依赖 C） | — |
 
 **已交付内容**：per-fd 多队列（每队列独立 ring + fence timeline + doorbell）、三个引擎（gfx/copy/compute）各自
 ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、7 指令教学 ISA +
@@ -274,8 +279,12 @@ debugfs `queues`/`compute` 视图、`-q`/`-p`/saxpy 测试与 autorun 集成。
 3. 设备级 scratch 水位按**完成序**回收——多引擎并发才暴露的分配/回收乱序
 4. **三种尺寸混淆**：ring 槽 64B / command 结构 48B / packet 40B，混用导致 scratch 水位下溢 48B/批
 
-**下一步建议**：C（VMID/VA/页表+显存管理）与 A/B/D 无依赖，`~/self/wt/c` 工作树已就绪；
-E（UVM 迁移）依赖 C+D；F（抢占）依赖 D；G（同步/图）依赖 B；H（fault containment）依赖 C+D。
+**下一步建议**（按性价比排序）：
+1. **G 收尾**：分支 `phase/g-sync` 的驱动已就绪，只差 `vgpu_test -g`（semaphore 轮询 + 多节点图）与 autorun 接线——一小时的工作量。
+2. **C 修复**：分支 `phase/c-vm` 只有 3 个编译错误（`vgpu_vm_unmap_range` 签名不一致 ×2 + 一处 static 冲突），修完即按验收标准跑 VMID 隔离与驱逐实验。
+3. **I 续作**：分支 `phase/i-power` 需先读懂代理人留下的 `vgpu_lat_ns`/`VGPU_MEM_LAT_BASE` 改名意图，再完成 DVFS 缩放与 rpm 唤醒测量。
+4. **E/H**：依赖 C 落地。
+教训：并行代理全部被 provider 速率限制打断——它们都写了大量代码但都没跑完验证；上面每个 WIP commit 都记录了断点。
 
 ## 10. 里程碑总览
 
