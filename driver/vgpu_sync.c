@@ -577,8 +577,7 @@ void vgpu_graph_execute(struct vgpu *v, struct vgpu_submission *sub)
 			break;
 		case VGPU_PKT_COPY:
 			vgpu_blit_pages(v, gn->blit.src_pages,
-					gn->blit.dst_pages, gn->blit.npages,
-					gn->blit.blit_off);
+					gn->blit.dst_pages, gn->blit.npages);
 			break;
 		case VGPU_PKT_LAUNCH:
 			/*

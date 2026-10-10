@@ -1013,9 +1013,15 @@ void vgpu_blit_unref(struct vgpu *v, struct vgpu_blit_ref *ref)
 
 	if (!ref->src_obj)
 		return;
+	/*
+	 * The arrays hold exactly the range's pages (see
+	 * vgpu_blit_pages), so the reference is dropped per entry —
+	 * adding blit_off here as well would unbalance the refcount of a
+	 * page that was never taken.
+	 */
 	for (i = 0; i < ref->npages; i++) {
-		put_page(ref->src_pages[ref->blit_off + i]);
-		put_page(ref->dst_pages[ref->blit_off + i]);
+		put_page(ref->src_pages[i]);
+		put_page(ref->dst_pages[i]);
 	}
 	kfree(ref->src_pages);
 	kfree(ref->dst_pages);

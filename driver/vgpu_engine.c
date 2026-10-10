@@ -63,15 +63,23 @@ const struct dma_fence_ops vgpu_fence_ops = {
  * Takes the page arrays explicitly so a graph node (which resolves its
  * own buffers) can reuse it — the single-BLIT submission wrapper below
  * is what saw the light of day first.
+ *
+ * The arrays ARE the range: vgpu_blit_pin() captured npages pages
+ * starting at the range's first page and nothing else, so they are
+ * indexed from 0. Adding the range's page offset here as well read one
+ * entry past the array for any copy not starting on page 0 — invisible
+ * while every submission copied at offset 0, and the first thing a
+ * graph node at a non-zero offset does (KASAN: slab-out-of-bounds read
+ * in vgpu_blit_pages, then a GPF in memcpy on the garbage page).
  */
 void vgpu_blit_pages(struct vgpu *v, struct page **src_pages,
-		     struct page **dst_pages, u32 npages, u32 off)
+		     struct page **dst_pages, u32 npages)
 {
 	u32 i;
 
 	for (i = 0; i < npages; i++) {
-		struct page *sp = src_pages[off + i];
-		struct page *dp = dst_pages[off + i];
+		struct page *sp = src_pages[i];
+		struct page *dp = dst_pages[i];
 		void *sv = kmap_local_page(sp);
 		void *dv = kmap_local_page(dp);
 		dma_addr_t saddr, daddr;
@@ -95,7 +103,7 @@ static void vgpu_blit(struct vgpu *v, struct vgpu_submission *sub)
 {
 	struct vgpu_blit_ref *b = &sub->blit;
 
-	vgpu_blit_pages(v, b->src_pages, b->dst_pages, b->npages, b->blit_off);
+	vgpu_blit_pages(v, b->src_pages, b->dst_pages, b->npages);
 }
 
 /*

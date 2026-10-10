@@ -59,6 +59,11 @@ struct vgpu_fence {
  */
 struct vgpu_blit_ref {
 	struct drm_gem_object *src_obj, *dst_obj;
+	/*
+	 * The range's pages: exactly npages entries, starting at the
+	 * range's first page (blit_off) — so consumers index them from
+	 * 0 and never add blit_off again.
+	 */
 	struct page **src_pages, **dst_pages;
 	u32 npages;
 	u32 blit_off;		/* page index of the range inside the BOs */
@@ -307,5 +312,5 @@ void vgpu_engine_fini(struct vgpu *v);
 irqreturn_t vgpu_irq_handler(int irq, void *dev_id);
 void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub);
 void vgpu_blit_pages(struct vgpu *v, struct page **src_pages,
-		     struct page **dst_pages, u32 npages, u32 off);
+		     struct page **dst_pages, u32 npages);
 #endif /* _VGPU_DRV_H_ */
