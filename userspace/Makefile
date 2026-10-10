@@ -4,7 +4,7 @@
 CC ?= gcc
 CFLAGS := -O2 -Wall -Wextra -static -I../driver/uapi -I/usr/include/libdrm
 
-all: vgpu_test examples/saxpy
+all: vgpu_test examples/saxpy examples/vgpu_smi
 
 vgpu_test: vgpu_test.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -12,7 +12,10 @@ vgpu_test: vgpu_test.c
 examples/saxpy: examples/saxpy.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+examples/vgpu_smi: examples/vgpu_smi.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 clean:
-	rm -f vgpu_test examples/saxpy
+	rm -f vgpu_test examples/saxpy examples/vgpu_smi
 
 .PHONY: all clean
