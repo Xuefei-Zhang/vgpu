@@ -342,6 +342,44 @@ struct vgpu_kernel {
 /* The device's "VRAM" budget: a TTM-lite LRU, not a real allocator. */
 #define VGPU_VM_VRAM_BUDGET	(16ULL * 1024 * 1024)
 #define VGPU_VM_MAX_COPY_PAGES	64		/* 256K per VA copy */
+
+/* --------------------------------------------------- phase H: GPU faults */
+
+/*
+ * Why an access could not be resolved through a context's page tables.
+ * This is the structured half of a fault: a real GPU writes a reason code
+ * into its fault buffer (UVM's fault type, amdgpu's IH fault source), and
+ * the driver keeps it alongside the address so a human (or an nvidia-smi
+ * aline) can tell what went wrong. The first three are NON-RECOVERABLE:
+ * the flag/scope is wrong, so no amount of migration will make the access
+ * legal — the only correct response is to fault the context.
+ */
+enum vgpu_fault_reason {
+	VGPU_FAULT_UNBOUND	= 1,	/* VA is not inside any bound range */
+	VGPU_FAULT_NOT_MANAGED,		/* range bound without VGPU_VM_BIND_MANAGED */
+	VGPU_FAULT_OOR,			/* word lands past the managed range's size */
+	VGPU_FAULT_INJECTED,		/* the inject_fault debugfs knob */
+	VGPU_FAULT_IO,			/* sibling drained by containment (-EIO) */
+};
+
+const char *vgpu_fault_str(u32 reason);
+
+/*
+ * One structured fault record — the record a real fault buffer holds per
+ * event: which submission, the faulting VA, the reason, and the VMID (the
+ * tag that says WHICH context is at fault). Kept in host memory by the
+ * driver, ring-buffered fixed size so a fault storm can never exhaust it.
+ */
+struct vgpu_fault {
+	u32 seqno;		/* the submission that faulted (fence id) */
+	u32 reason;		/* enum vgpu_fault_reason */
+	u64 va;			/* the faulting GPU virtual address */
+	u32 vmid;		/* which context (0 if it had no VA space) */
+	u32 _pad;
+	unsigned long when;	/* jiffies: when the driver saw it */
+};
+
+#define VGPU_FAULT_RING	16		/* records kept; a ring in host memory */
 /*
  * Phase E: the largest managed range a VA-named launch may name. A
  * launch walks its tables on every LD/ST, so the ceiling is both a
@@ -400,6 +438,18 @@ struct vgpu_file {
 	struct list_head kernels;	/* struct vgpu_kernel */
 	struct vgpu_queue *default_q;	/* lazily created GFX queue (qid 0) */
 	struct vgpu_vm *vm;		/* phase C: this fd's GPU address space */
+	/*
+	 * Phase H: fault containment is scoped to ONE context. When a
+	 * submission of this fd hits a non-recoverable fault the driver
+	 * records it and sets this flag; every engine then refuses to RUN
+	 * any further submission of this context (draining it with -EIO),
+	 * while every OTHER context keeps executing untouched. It is set
+	 * from the compute engine's workqueue context and read by every
+	 * engine at pickup; a monotonic bool, so a plain store is enough
+	 * (a racing pickup either sees the poison one iteration later or
+	 * retires one last, already-accepted submission — both benign).
+	 */
+	bool poisoned;
 	struct vgpu *vf_dev;
 	struct drm_file *drm_file;	/* for handle -> object lookups */
 	u32 next_qid;
@@ -528,6 +578,23 @@ struct vgpu {
 	 * cs_preemptions / cs_timeslices split that by reason.
 	 */
 	u64 cs_ctx_switches, cs_preemptions, cs_timeslices;
+
+	/*
+	 * Phase H: the fault buffer. A fixed ring of structured records in
+	 * host memory — one entry per non-recoverable fault — the driver-
+	 * side source an nvidia-smi-alike reads (and the thing a RAS
+	 * discussion is about: a GPU reports structured faults, it does not
+	 * just print a line). Protected by its own spinlock so the engine
+	 * (workqueue context) can record while debugfs reads/clears; the
+	 * ring is fixed-size so a fault storm cannot exhaust host memory.
+	 * fb_head is the next slot to write, fb_total counts every fault
+	 * ever recorded (so the "contained" siblings that wrap the ring
+	 * are still countable).
+	 */
+	struct vgpu_fault fb[VGPU_FAULT_RING];
+	u32 fb_head, fb_total, fb_injected;
+	spinlock_t fb_lock;
+	bool inject_fault;		/* debugfs one-shot: force the next fault */
 };
 
 #define to_vgpu(drm_dev) container_of(drm_dev, struct vgpu, dev)
@@ -600,6 +667,17 @@ void vgpu_vm_release_sub(struct vgpu_submission *sub);
 void vgpu_vm_evict_all(struct vgpu *v);
 int vgpu_vm_show(struct seq_file *s, void *data);
 void vgpu_vm_destroy_all(struct vgpu *v);
+
+/*
+ * Phase H (vgpu_fault.c): record a structured fault, contain the
+ * offending context, expose the buffer. vgpu_fault_report() is the ONE
+ * place the compute engine calls when an access cannot be resolved: it
+ * writes the record, poisons the context and prints the [vgpu:fault]
+ * line. Returns the errno the submission's fence should carry.
+ */
+int vgpu_fault_report(struct vgpu_submission *sub, u64 va, u32 reason);
+int vgpu_fault_show(struct seq_file *s, void *data);
+void vgpu_fault_clear(struct vgpu *v);
 /* vgpu_compute.c */
 struct vgpu_instr;
 enum vgpu_sched vgpu_compute_run(struct vgpu *v, struct vgpu_submission *sub);

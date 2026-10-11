@@ -91,20 +91,66 @@ static u32 vgpu_lat_ns(struct vgpu *v)
 static u32 vgpu_mem_word(struct vgpu_submission *sub, u32 addr, bool write,
 			 u32 val)
 {
+	struct vgpu *v = sub->v;
+
 	if (sub->launch_va) {
 		u64 va = sub->launch_va + (u64)addr * sizeof(u32);
 		struct vgpu_va_page pg = {};
 		u32 *p;
 		int ret;
 
+		/*
+		 * Phase H injection: a one-shot debugfs knob (inject_fault)
+		 * forces THIS access to fault, so the structured-record +
+		 * containment path is testable without a program that
+		 * actually runs off the end of its buffer — vgem's FAKE_HANG,
+		 * for faults. Deterministic: the very next LD/ST faults,
+		 * however legal it would otherwise have been.
+		 *
+		 * The !sub->error guard is load-bearing: a memory op runs
+		 * across all 32 lanes of a warp in lockstep, so without it a
+		 * single bad address would record 32 identical faults. The
+		 * first lane to fault wins and aborts the warp; the rest
+		 * short-circuit. (Same rule the engine's other fault sites
+		 * use.)
+		 */
+		if (v->inject_fault && !sub->error) {
+			v->inject_fault = false;
+			sub->error = vgpu_fault_report(sub, va,
+						       VGPU_FAULT_INJECTED);
+			return 0;
+		}
 		if (va + sizeof(u32) > sub->launch_va + sub->launch_size) {
-			/* outside the managed range: a fault, not garbage */
-			sub->error = -ENOENT;
+			/*
+			 * Outside the managed range: a NON-RECOVERABLE fault.
+			 * The kernel computed an address past the buffer it
+			 * was handed (a wild pointer). No migration can make
+			 * that legal, so this is phase E's other half: record
+			 * it, contain the context, fail this submission — the
+			 * device keeps running (see vgpu_fault.c).
+			 */
+			if (!sub->error)
+				sub->error = vgpu_fault_report(sub, va,
+							       VGPU_FAULT_OOR);
 			return 0;
 		}
 		ret = vgpu_vm_loan(sub->vm, va, &pg);
 		if (ret) {
-			sub->error = ret;
+			/*
+			 * The page is not reachable through this context's
+			 * tables. An ENOMEM is a resource failure (not the
+			 * context's doing) and is passed through untouched;
+			 * an ENOENT is a genuine illegal access (unbound VA /
+			 * not bound as managed) — the non-recoverable case,
+			 * recorded and contained rather than migrated.
+			 */
+			if (ret == -ENOMEM) {
+				sub->error = ret;
+				return 0;
+			}
+			if (!sub->error)
+				sub->error = vgpu_fault_report(sub, va,
+							       VGPU_FAULT_UNBOUND);
 			return 0;
 		}
 		if (pg.migrated) {

@@ -431,6 +431,67 @@ static int vgpu_dbg_regs_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(vgpu_dbg_regs);
 
+/* -------------------------------------------------- phase H: fault view */
+
+/*
+ * The phase-H fault buffer: the nvidia-smi-shaped half of fault
+ * containment. Reading it lists every non-recoverable fault the device
+ * has recorded — the offending VA, the reason, and the VMID that says
+ * which context — oldest first. Writing anything clears the ring, so a
+ * test starts each scenario from a known-empty buffer (it cannot undo a
+ * context's poison flag, which lifetime is exactly the fd's).
+ */
+static int vgpu_dbg_faults_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, vgpu_fault_show, inode->i_private);
+}
+
+static ssize_t vgpu_dbg_faults_write(struct file *file,
+				     const char __user *ubuf, size_t len,
+				     loff_t *ppos)
+{
+	struct vgpu *v = file_inode(file)->i_private;
+
+	vgpu_fault_clear(v);
+	return len;
+}
+
+static const struct file_operations vgpu_dbg_faults_fops = {
+	.owner	= THIS_MODULE,
+	.open	= vgpu_dbg_faults_open,
+	.read	= seq_read,
+	.write	= vgpu_dbg_faults_write,
+	.llseek	= seq_lseek,
+	.release = single_release,
+};
+
+/*
+ * inject_fault: write anything to arm a ONE-SHOT fault. The next
+ * global-memory access on the compute engine faults — however legal it
+ * would otherwise be — and the structured-record + containment path runs
+ * end to end. This is how a real driver tests fault recovery without
+ * needing a program that genuinely dereferences a wild pointer on every
+ * run (vgem's FAKE_HANG precedent).
+ */
+static ssize_t vgpu_dbg_inject_write(struct file *file,
+				     const char __user *ubuf, size_t len,
+				     loff_t *ppos)
+{
+	struct vgpu *v = file_inode(file)->i_private;
+
+	v->inject_fault = true;
+	dev_info(&v->pdev->dev,
+		 "[vgpu:fault] inject_fault armed: the next compute LD/ST will fault\n");
+	return len;
+}
+
+static const struct file_operations vgpu_dbg_inject_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.write	= vgpu_dbg_inject_write,
+	.llseek	= noop_llseek,
+};
+
 /* ---------------------------------------------------------------- probe */
 
 static int vgpu_probe(struct platform_device *pdev)
@@ -455,6 +516,7 @@ static int vgpu_probe(struct platform_device *pdev)
 	v->pdev = pdev;
 	v->clock_hz = VGPU_REF_CLOCK_HZ;	/* DVFS starts at the reference */
 	spin_lock_init(&v->lock);
+	spin_lock_init(&v->fb_lock);	/* phase H: the fault buffer */
 	INIT_LIST_HEAD(&v->in_flight);
 	INIT_LIST_HEAD(&v->queue_list);
 	INIT_LIST_HEAD(&v->kernel_list);
@@ -520,6 +582,9 @@ static int vgpu_probe(struct platform_device *pdev)
 	debugfs_create_file("regs", 0444, v->dbg, v, &vgpu_dbg_regs_fops);
 	debugfs_create_file("vm", 0644, v->dbg, v, &vgpu_dbg_vm_fops);
 	debugfs_create_file("clock_hz", 0644, v->dbg, v, &vgpu_dbg_clock_fops);
+	/* phase H: the fault buffer (read/clear) and the fault-injection knob */
+	debugfs_create_file("faults", 0644, v->dbg, v, &vgpu_dbg_faults_fops);
+	debugfs_create_file("inject_fault", 0200, v->dbg, v, &vgpu_dbg_inject_fops);
 
 	ret = drm_dev_register(&v->dev, 0);
 	if (ret)

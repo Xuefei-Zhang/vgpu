@@ -4,7 +4,7 @@
 # (docs/adr/0003), so kernel and module always match.
 
 obj-m := vgpu.o
-vgpu-y := vgpu_drv.o vgpu_engine.o vgpu_compute.o vgpu_sync.o vgpu_vm.o
+vgpu-y := vgpu_drv.o vgpu_engine.o vgpu_compute.o vgpu_sync.o vgpu_vm.o vgpu_fault.o
 KDIR ?= $(HOME)/linux
 PWD := $(shell pwd)
 

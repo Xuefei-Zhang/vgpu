@@ -520,10 +520,30 @@ static void vgpu_engine_work(struct work_struct *work, int engine)
 			sub->npkts = 0;
 		}
 
-		r = vgpu_execute(v, sub);
-		if (r != VGPU_SCHED_DONE) {
-			vgpu_ctx_switch(v, sub, r);
-			continue;	/* let the scheduler pick the next */
+		/*
+		 * Phase H: fault containment, SCOPED TO ONE CONTEXT. This
+		 * submission's context is poisoned — a sibling submission of
+		 * the same fd hit a non-recoverable fault (see
+		 * vgpu_fault_report). Rather than run it we drain it with
+		 * -EIO: the fetch above already ran, so the scratch reserve
+		 * is reclaimed correctly by the finish path (ncmds is set),
+		 * and the fence gets -EIO through the ordinary bottom half.
+		 * The faulting submission itself faults one pick EARLIER
+		 * (the poison is set mid-execution, not before it), so it
+		 * retires with its own specific error here first. Other
+		 * contexts never enter this branch: the flag is one fd's, so
+		 * the device is not reset and everyone else keeps running.
+		 */
+		if (sub->q->file->poisoned) {
+			if (!sub->error)
+				sub->error = vgpu_fault_report(sub, 0,
+							       VGPU_FAULT_IO);
+		} else {
+			r = vgpu_execute(v, sub);
+			if (r != VGPU_SCHED_DONE) {
+				vgpu_ctx_switch(v, sub, r);
+				continue;	/* let the scheduler pick the next */
+			}
 		}
 
 		dev_info(&v->pdev->dev,

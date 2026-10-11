@@ -22,6 +22,7 @@ cp "$ROOT/driver/vgpu.ko" "$INITDIR/root/"
 cp "$ROOT/userspace/vgpu_test" "$INITDIR/root/"
 [ -f "$ROOT/userspace/examples/saxpy" ] && cp "$ROOT/userspace/examples/saxpy" "$INITDIR/root/"
 [ -f "$ROOT/userspace/examples/uvm_saxpy" ] && cp "$ROOT/userspace/examples/uvm_saxpy" "$INITDIR/root/"
+[ -f "$ROOT/userspace/examples/faults" ] && cp "$ROOT/userspace/examples/faults" "$INITDIR/root/"
 cp "$ROOT/userspace/examples/vgpu_smi" "$INITDIR/root/"
 # autorun marker (if present next to the scripts) triggers the test on boot
 [ -f "$ROOT/autorun" ] && touch "$INITDIR/root/autorun"
@@ -133,6 +134,10 @@ echo "=== phase I: runtime PM, DVFS clock, per-context accounting ==="
 /root/vgpu_test -i || exit 1
 echo "--- dvfs/rpm view (debugfs stats) ---"
 cat /sys/kernel/debug/vgpu/stats
+echo "=== phase H: fault containment (one context's wild pointer must not take down the others) ==="
+/root/faults || exit 1
+echo "--- fault buffer: the structured records the device kept ---"
+cat /sys/kernel/debug/vgpu/faults
 echo "=== ftrace: function_graph over vgpu_* ==="
 TR=/sys/kernel/debug/tracing
 echo function_graph > "$TR/current_tracer"
