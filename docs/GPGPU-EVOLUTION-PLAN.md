@@ -273,7 +273,7 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | J | vgpu-smi-lite 观测工具 | ✅ 已完成并 guest 验证 | `a71f6ba` |
 | I | RPM / DVFS / per-context 计费 | ✅ 已完成并 guest 验证 | `28d6a3f` |
 | E | 统一虚拟内存：managed VA + 引擎侧按需迁移 | ✅ 已完成并 guest 验证 | `dd42aa1` |
-| H | fault containment / fault buffer | ⬜ 未开始（C 已落地，无阻塞） | — |
+| H | fault containment / fault buffer | ✅ 已完成并 guest 验证 | `93527f3` |
 **已交付内容**：per-fd 多队列（每队列独立 ring + fence timeline + doorbell）、三个引擎（gfx/copy/compute）各自
 ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、7 指令教学 ISA +
 warp 同步执行器 + LAUNCH packet + MODULE_LOAD 模块注册 + broadcast/coalesced/strided 三类访存统计、
@@ -296,6 +296,17 @@ kernel 的 LD/ST 于是都是 GPU VA，逐个通过**提交者的页表**解析�
 launch，首次缺页即迁移回驻，结果全对且 fault 计数上升（连跑两轮证明是机制不是侥幸）；同一 buffer
 不带 `MANAGED` 标志再绑一次，VA 命名 launch 被 `-ENOENT` 拒绝（标志是承重墙）。
 
+**Phase H 新增**：`vgpu_fault.c`——host 内存里的 **fault buffer**（16 项定长环形，每项 = `{seqno, va, reason, vmid, jiffies}`，
+即真实 fault buffer 的结构化记录），debugfs `faults`（可读、可写清除）+ `[vgpu:fault]` dmesg 行；**不可恢复 fault 的识别与分类**
+——VA 命名 launch 越出 managed 区间（`out-of-range`，即"野指针"）、指名未绑定/非 managed 的 VA、或 `inject_fault` debugfs
+一次性注入（vgem `FAKE_HANG` 先例）。定位到 context 的 containment：出现 fault 时给该 **context**（`sub->q->file`）打
+`poisoned` 标志，引擎每次取下一个提交时若发现属于该 context 就**不再运行**、以 `-EIO` 排干（复用 `vgpu_drain()` 的 -EIO
+机制，但按 context 而非按 device）。**不 reset 全卡**：其他 context 和全新 context 照常运行——这正是 GPU RAS 的核心论点。
+fault 提交自身照原错误路径失败（engine→fence→VGPU_WAIT），phase E 的按需迁移原样保留、只管可恢复的那半。
+**实例**：`userspace/examples/faults.c`——context A 野指针 fault、其合法兄弟提交被排干 -EIO、context B 在 A fault 之后
+**照样正确完成**、全新 context C 仍可用、`inject_fault` 强制 fault，五条断言都点名 fault buffer 里的记录；连入 `run_test.sh`
+（ftrace/rmmod 之前）。
+
 **过程中抓到并修复的 4 个真 bug**（都有 guest 证据，写入各自 commit message）：
 1. 自旋锁内调可睡眠 API（`drm_gem_shmem_pin` 的页分配 + `set_pages_array`）
 2. `container_of` 数组元素陷阱：减了数组基址偏移导致 engine 1/2 的设备指针错位
@@ -310,8 +321,7 @@ launch，首次缺页即迁移回驻，结果全对且 fault 计数上升（连�
 7. VM_BIND 引用计数：`drm_gem_object_lookup` 的引用 + `drm_gem_object_get` 共拿了两个引用，unbind 只还一个，
    每个 bind 泄漏一个对象引用
 
-**下一步建议**：C/E 已落地（E 用 VA 命名 launch + 引擎侧按需迁移补完了 UVM 的"迁移"半边）；
-剩下的 H（fault containment）只依赖 C+D，是最后一块未交付的机制。
+**下一步建议**：C/E/H 已落地（E 补完 UVM 的"迁移"半边、H 补完"不可恢复 fault 的隔离与结构化记录"半边），方案 §4 的 A→J 阶段全部交付完毕。
 ## 10. 里程碑总览
 
 | 阶段 | 主题 | 工作量 | 面试故事 |
