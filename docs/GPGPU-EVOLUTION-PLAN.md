@@ -259,8 +259,12 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | A | 多引擎多队列（stream 语义） | ✅ 已完成并 guest 验证 | `1657cdc` |
 | B | 门铃 + 引擎侧取指（packet 提交） | ✅ 已完成并 guest 验证 | `8ebd16f` |
 | D | 计算语义：kernel launch / warp 执行 / 合并率 | ✅ 已完成并 guest 验证 | `f6b9b0c` |
-| C | GPU 虚拟内存：VMID / VA / 页表 / VRAM 预算驱逐 | ✅ 已完成并 guest 验证 | 见 `phase/c-vm` 分支 |
-| E–J | 见上表 | ⬜ 待开发 | — |
+| C | GPU 虚拟内存：VMID / VA / 页表 / VRAM 预算驱逐 | ✅ 已完成并 guest 验证 | 合并于 main |
+| F | 抢占与时间片 | ✅ 已完成并 guest 验证 | `74e5142` |
+| G | timeline semaphore / event / 图提交 | ✅ 已完成并 guest 验证 | `b19abbf` |
+| J | vgpu-smi-lite 观测工具 | ✅ 已完成并 guest 验证 | `a71f6ba` |
+| I | RPM / DVFS / per-context 计费 | ✅ 已完成并 guest 验证 | `28d6a3f` |
+| E, H | UVM 按需迁移 / fault containment | ⬜ 未开始（C 已落地，无阻塞） | — |
 **已交付内容**：per-fd 多队列（每队列独立 ring + fence timeline + doorbell）、三个引擎（gfx/copy/compute）各自
 ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、7 指令教学 ISA +
 warp 同步执行器 + LAUNCH packet + MODULE_LOAD 模块注册 + broadcast/coalesced/strided 三类访存统计、
