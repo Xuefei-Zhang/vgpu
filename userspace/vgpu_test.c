@@ -14,6 +14,8 @@
  * -m N: fork N processes; each runs the chain with its own BOs and its
  * own ring slot (the ring is shared scratch: disjoint slots, like real
  * per-context rings).
+ * -i:   phase I: runtime PM (sleep + wake), the DVFS clock knob, and
+ *        per-context compute accounting.
  * -p:   packet + doorbell submission (phase B): the engine fetches.
  * -q:   multi-queue / multi-engine: one fd, one stream per engine
  *        (streams + per-engine command classes).
@@ -407,7 +409,6 @@ static int run_queues(void)
 	uint32_t qids[3], seqnos[3];
 	struct vgpu_queue_create qc;
 	struct vgpu_cmd cmds[8];
-	struct vgpu_queue_destroy qd;
 	static const uint32_t engines[3] = { VGPU_ENGINE_GFX,
 					     VGPU_ENGINE_COPY,
 					     VGPU_ENGINE_COMPUTE };
@@ -539,6 +540,8 @@ static int run_queues(void)
 	}
 
 	/* destroy an unknown queue, then a real one */
+	struct vgpu_queue_destroy qd;
+
 	memset(&qd, 0, sizeof(qd));
 	qd.qid = 0xdead;
 	if (expect_errno(fd, &qd, DRM_IOCTL_VGPU_QUEUE_DESTROY, ENOENT,
@@ -2150,12 +2153,301 @@ static int run_vm(void)
 	return 0;
 }
 
+
+/*
+ * Phase I: runtime power management, DVFS and per-context accounting.
+ *
+ * The device should power-gate after ~2s idle and the next submission
+ * must wake it (a measurable cost, not a hang); a clock knob must scale
+ * the compute engine's modelled memory latency; and each queue must
+ * account its own modelled compute time.
+ */
+/*
+ * Read "key <number>" out of a debugfs file. The key may appear at the
+ * start of a line ("clock  1000 MHz") or after a word ("rpm  suspends
+ * 3, ..."), so search for it inside the line and skip past it.
+ */
+static long dbg_long(const char *path, const char *key, long dflt)
+{
+	FILE *f = fopen(path, "r");
+	char line[256];
+	long val = dflt;
+
+	if (!f)
+		return dflt;
+	while (fgets(line, sizeof(line), f)) {
+		char *p = strstr(line, key);
+
+		if (!p)
+			continue;
+		val = strtol(p + strlen(key), NULL, 10);
+		break;
+	}
+	fclose(f);
+	return val;
+}
+
+static int run_power(void)
+{
+	int fd, rc = 1;
+	struct vgpu_bo_create bo;
+	struct vgpu_queue_create qc;
+	struct vgpu_module_load ml;
+	struct vgpu_doorbell db;
+	struct vgpu_wait w;
+	uint8_t *ring;
+	struct vgpu_packet *pk;
+	uint32_t ring_put = 0;	/* the doorbell needs put to advance past get */
+	uint32_t *args;
+	long ns_a, ns_b, ns_ref, ns_before, ns_after;
+	long susp_a, susp_b, clock_a, clock_b;
+	int i;
+	static const struct vgpu_instr code[] = {
+		{ .op = VGPU_ISA_MOVI, .dst = 15, .a = 0 },
+		{ .op = VGPU_ISA_LD,   .dst = 1,  .a = 15, .b = 1 },
+		{ .op = VGPU_ISA_LD,   .dst = 2,  .a = 15, .b = 2 },
+		{ .op = VGPU_ISA_LD,   .dst = 3,  .a = 15, .b = 3 },
+		{ .op = VGPU_ISA_LD,   .dst = 4,  .a = 15, .b = 4 },
+		{ .op = VGPU_ISA_ADD,  .dst = 5,  .a = 3,  .b = 0 },
+		{ .op = VGPU_ISA_LD,   .dst = 6,  .a = 5,  .b = 0 },
+		{ .op = VGPU_ISA_MUL,  .dst = 7,  .a = 1,  .b = 6 },
+		{ .op = VGPU_ISA_ADD,  .dst = 8,  .a = 7,  .b = 2 },
+		{ .op = VGPU_ISA_ADD,  .dst = 9,  .a = 4,  .b = 0 },
+		{ .op = VGPU_ISA_ST,   .dst = 8,  .a = 9,  .b = 0 },
+		{ .op = VGPU_ISA_EXIT },
+	};
+
+	fd = open("/dev/dri/renderD128", O_RDWR);
+	if (fd < 0)
+		fd = open("/dev/dri/card0", O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "FAIL: open: %s\n", strerror(errno));
+		return 1;
+	}
+
+	/* a small kernel + an argument buffer: the same saxpy shape */
+	memset(&ml, 0, sizeof(ml));
+	ml.nregs = 16;
+	ml.smem = 0;
+	ml.ninstr = sizeof(code) / sizeof(code[0]);
+	ml.code = (uint64_t)(uintptr_t)code;
+	if (check(fd, &ml, DRM_IOCTL_VGPU_MODULE_LOAD, "module_load"))
+		goto out;
+
+	memset(&bo, 0, sizeof(bo));
+	bo.size = 8192;		/* >= PAGE_SIZE: 8 words header + 2 x 512 */
+	if (check(fd, &bo, DRM_IOCTL_VGPU_BO_CREATE, "bo_create"))
+		goto out;
+	args = mmap(NULL, bo.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		    fd, (off_t)bo.mmap_offset);
+	if (args == MAP_FAILED) {
+		fprintf(stderr, "FAIL: mmap: %s\n", strerror(errno));
+		goto out;
+	}
+	args[0] = 512;
+	args[1] = 3;
+	args[2] = 7;
+	args[3] = 8;
+	args[4] = 8 + 512;
+	for (i = 0; i < 512; i++)
+		args[8 + i] = i + 1;
+
+	memset(&qc, 0, sizeof(qc));
+	qc.engine = VGPU_ENGINE_COMPUTE;
+	qc.prio = 1;
+	qc.nslots = 16;
+	if (check(fd, &qc, DRM_IOCTL_VGPU_QUEUE_CREATE, "queue_create"))
+		goto out;
+	ring = mmap(NULL, qc.ring_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		    fd, (off_t)qc.mmap_offset);
+	if (ring == MAP_FAILED) {
+		fprintf(stderr, "FAIL: mmap ring: %s\n", strerror(errno));
+		goto out;
+	}
+	pk = (struct vgpu_packet *)ring;
+
+	/* ---- (a) the device sleeps, then wakes on the next submit ---- */
+	susp_a = dbg_long("/sys/kernel/debug/vgpu/stats", "suspends ", 0);
+	printf("phase I/a: idling past the autosuspend delay...\n");
+	sleep(4);			/* autosuspend is 2s */
+
+	ns_before = ns_ref =
+		dbg_long("/sys/kernel/debug/vgpu/compute", "latency ", 0);
+
+	pk = (struct vgpu_packet *)(ring + ring_put);
+	memset(pk, 0, sizeof(*pk));
+	pk[0].type = VGPU_PKT_LAUNCH;
+	pk[0].launch.kid = ml.kid;
+	pk[0].launch.grid = 8;
+	pk[0].launch.block = 64;
+	pk[0].launch.args_bo = bo.handle;
+	pk[0].launch.args_off = 0;
+	ring_put += sizeof(*pk);
+	memset(&db, 0, sizeof(db));
+	db.qid = qc.qid;
+	db.put = ring_put;
+	if (check(fd, &db, DRM_IOCTL_VGPU_DOORBELL, "doorbell(after idle)"))
+		goto out;
+	memset(&w, 0, sizeof(w));
+	w.seqno = db.seqno;
+	w.timeout_ms = 5000;
+	if (check(fd, &w, DRM_IOCTL_VGPU_WAIT, "wait(after idle)"))
+		goto out;
+	if (w.status != 0) {
+		fprintf(stderr, "FAIL: launch after idle status=%d\n",
+			(int)w.status);
+		goto out;
+	}
+	susp_b = dbg_long("/sys/kernel/debug/vgpu/stats", "suspends ", 0);
+	printf("phase I/a: rpm suspends %ld -> %ld after the idle window\n",
+	       susp_a, susp_b);
+	/* this launch's share of the cumulative latency counter */
+	ns_after = dbg_long("/sys/kernel/debug/vgpu/compute", "latency ", 0);
+	ns_ref = ns_after - ns_ref;
+	printf("phase I/a: modelled latency %ld -> %ld (this launch: %ld ns)\n",
+	       ns_before, ns_after, ns_ref);
+	if (susp_b <= susp_a) {
+		fprintf(stderr,
+			"FAIL: the device did not power-gate during the idle window\n");
+		goto out;
+	}
+	printf("[pid %d] PASS: rpm: the device slept and woke for a submission\n",
+	       (int)getpid());
+
+	/* ---- (b) the clock knob scales the modelled latency ---- */
+	/*
+	 * The counter is cumulative since insmod, so what matters is the
+	 * DELTA each launch adds: a launch at half the clock must add
+	 * roughly twice the modelled latency of one at the reference.
+	 */
+	clock_a = dbg_long("/sys/kernel/debug/vgpu/stats", "clock", 0);
+	ns_a = dbg_long("/sys/kernel/debug/vgpu/compute", "latency ", 0);
+	{
+		FILE *f = fopen("/sys/kernel/debug/vgpu/clock_hz", "w");
+
+		if (!f) {
+			fprintf(stderr, "FAIL: open clock_hz: %s\n",
+				strerror(errno));
+			goto out;
+		}
+		fprintf(f, "%ld\n", clock_a / 2);	/* half the clock */
+		fclose(f);
+	}
+	/* one more launch at the lower clock, appended to the ring */
+	pk = (struct vgpu_packet *)(ring + ring_put);
+	memset(pk, 0, sizeof(*pk));
+	pk[0].type = VGPU_PKT_LAUNCH;
+	pk[0].launch.kid = ml.kid;
+	pk[0].launch.grid = 8;
+	pk[0].launch.block = 64;
+	pk[0].launch.args_bo = bo.handle;
+	pk[0].launch.args_off = 0;
+	ring_put += sizeof(*pk);
+	memset(&db, 0, sizeof(db));
+	db.qid = qc.qid;
+	db.put = ring_put;
+	if (check(fd, &db, DRM_IOCTL_VGPU_DOORBELL, "doorbell(low clock)"))
+		goto out;
+	memset(&w, 0, sizeof(w));
+	w.seqno = db.seqno;
+	w.timeout_ms = 5000;
+	if (check(fd, &w, DRM_IOCTL_VGPU_WAIT, "wait(low clock)"))
+		goto out;
+	clock_b = dbg_long("/sys/kernel/debug/vgpu/stats", "clock", 0);
+	ns_b = dbg_long("/sys/kernel/debug/vgpu/compute", "latency ", 0);
+	printf("phase I/b: clock %ld -> %ld MHz, launch cost %ld -> %ld ns\n",
+	       clock_a, clock_b, ns_ref, ns_b - ns_a);
+	if (clock_b != clock_a / 2) {
+		fprintf(stderr, "FAIL: the clock knob did not take effect\n");
+		goto out;
+	}
+	if (ns_b - ns_a < ns_ref) {
+		fprintf(stderr,
+			"FAIL: the low-clock launch did not cost more (ref %ld, got %ld)\n",
+			ns_ref, ns_b - ns_a);
+		goto out;
+	}
+	printf("[pid %d] PASS: dvfs: halving the clock at least doubles the modelled kernel time (%ld -> %ld ns)\n",
+	       (int)getpid(), ns_ref, ns_b - ns_a);
+	/* restore the reference clock */
+	{
+		FILE *f = fopen("/sys/kernel/debug/vgpu/clock_hz", "w");
+
+		if (f) {
+			fprintf(f, "%ld\n", clock_a);
+			fclose(f);
+		}
+	}
+
+	/* ---- (c) per-context accounting ---- */
+	{
+		FILE *f = fopen("/sys/kernel/debug/vgpu/queues", "r");
+		char line[256];
+		int found = 0;
+
+		if (!f) {
+			fprintf(stderr, "FAIL: open queues: %s\n",
+				strerror(errno));
+			goto out;
+		}
+		while (fgets(line, sizeof(line), f)) {
+			char *p = line;
+
+			/*
+			 * "compute" appears twice in the line (the engine
+			 * name and the accounting field) — take any
+			 * occurrence that is followed by a positive number.
+			 */
+			while ((p = strstr(p, "compute ")) != NULL) {
+				long v = strtol(p + strlen("compute "), NULL, 10);
+
+				if (v > 0)
+					found = 1;
+				p++;
+			}
+		}
+		if (!found) {
+			rewind(f);
+			while (fgets(line, sizeof(line), f))
+				fprintf(stderr, "queues| %s", line);
+			fclose(f);
+			fprintf(stderr,
+				"FAIL: no per-queue compute accounting found\n");
+			goto out;
+		}
+		fclose(f);
+		printf("[pid %d] PASS: accounting: the queue shows its modelled compute ns\n",
+		       (int)getpid());
+	}
+
+	/* the launch results are still correct after all that */
+	for (i = 0; i < 512; i++) {
+		uint32_t want = 3 * args[8 + i] + 7;
+		uint32_t got = args[8 + 512 + i];
+
+		if (got != want) {
+			fprintf(stderr, "FAIL: out[%d] = %u, want %u\n",
+				i, got, want);
+			goto out;
+		}
+	}
+	printf("phase I: runtime PM, DVFS and per-context accounting all pass\n");
+	rc = 0;
+
+out:
+	close(fd);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	int m = 1, i;
 
 	if (argc > 1 && !strcmp(argv[1], "-m"))
 		m = (argc > 2) ? atoi(argv[2]) : 4;
+
+	if (argc > 1 && !strcmp(argv[1], "-i"))
+		return run_power() ? 1 : 0;
 
 	if (argc > 1 && !strcmp(argv[1], "-q"))
 		return run_queues() ? 1 : 0;

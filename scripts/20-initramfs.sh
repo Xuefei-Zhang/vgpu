@@ -121,7 +121,12 @@ cat /sys/kernel/debug/vgpu/sync
 echo "=== phase C: GPU virtual memory (VMID isolation + VRAM budget) ==="
 /root/vgpu_test -v || exit 1
 echo "--- vm view: per-context VA ranges, budget, evictions ---"
-cat /sys/kernel/debug/vgpu/vmecho "=== ftrace: function_graph over vgpu_* ==="
+cat /sys/kernel/debug/vgpu/vm
+echo "=== phase I: runtime PM, DVFS clock, per-context accounting ==="
+/root/vgpu_test -i || exit 1
+echo "--- dvfs/rpm view (debugfs stats) ---"
+cat /sys/kernel/debug/vgpu/stats
+echo "=== ftrace: function_graph over vgpu_* ==="
 TR=/sys/kernel/debug/tracing
 echo function_graph > "$TR/current_tracer"
 echo 'vgpu_*' > "$TR/set_ftrace_filter"

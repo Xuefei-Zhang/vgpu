@@ -11,6 +11,8 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/pm_runtime.h>
+#include <linux/ktime.h>
 #include <linux/idr.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -57,6 +59,33 @@ static int vgpu_wait_ioctl(struct drm_device *dev, void *data,
 			   struct drm_file *file);
 static int vgpu_query_ioctl(struct drm_device *dev, void *data,
 			    struct drm_file *file);
+static void vgpu_pm_submit_begin(struct vgpu *v);
+
+/*
+ * Runtime PM callbacks. QEMU has no GPU power domains, so there is no
+ * hardware to gate — the callbacks exist to make the power-gate
+ * observable and countable, which is what a real driver's rpm
+ * discipline is FOR: the device sleeps when nobody submits, and the
+ * wake is measured at the submit path.
+ */
+static int vgpu_runtime_suspend(struct device *dev)
+{
+	struct vgpu *v = dev_get_drvdata(dev);
+
+	v->rpm_suspends++;
+	dev_info(dev, "[vgpu:rpm] power-gated (#%u)\n", v->rpm_suspends);
+	return 0;
+}
+
+static int vgpu_runtime_resume(struct device *dev)
+{
+	return 0;
+}
+
+static const struct dev_pm_ops vgpu_pm_ops = {
+	.runtime_suspend = vgpu_runtime_suspend,
+	.runtime_resume	= vgpu_runtime_resume,
+};
 
 static const struct drm_ioctl_desc vgpu_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(VGPU_BO_CREATE, vgpu_bo_create_ioctl, DRM_RENDER_ALLOW),
@@ -109,6 +138,10 @@ static int vgpu_dbg_stats_show(struct seq_file *s, void *unused)
 	unsigned long flags;
 	int i;
 
+	seq_printf(s, "clock      %u MHz\n", v->clock_hz);
+	seq_printf(s, "rpm        suspends %u, last resume %llu us\n",
+		   v->rpm_suspends, v->rpm_last_resume_ns / 1000);
+
 	spin_lock_irqsave(&v->lock, flags);
 	seq_printf(s, "submitted  %llu\n", v->stats_submitted);
 	seq_printf(s, "completed  %llu\n", v->stats_completed);
@@ -132,6 +165,50 @@ static int vgpu_dbg_stats_show(struct seq_file *s, void *unused)
 DEFINE_SHOW_ATTRIBUTE(vgpu_dbg_stats);
 
 /*
+ * The DVFS knob: /sys/kernel/debug/vgpu/clock_hz. Writing a frequency
+ * changes the compute engine's modelled memory latency on the next
+ * launch (see vgpu_lat_ns()), which is how a real frequency governor
+ * shows up in kernel runtimes.
+ */
+static ssize_t vgpu_dbg_clock_read(struct file *f, char __user *buf,
+				   size_t n, loff_t *off)
+{
+	struct vgpu *v = file_inode(f)->i_private;
+	char tmp[64];
+	int len;
+
+	len = snprintf(tmp, sizeof(tmp), "%u\n", v->clock_hz);
+	return simple_read_from_buffer(buf, n, off, tmp, len);
+}
+
+static ssize_t vgpu_dbg_clock_write(struct file *f, const char __user *buf,
+				    size_t n, loff_t *off)
+{
+	struct vgpu *v = file_inode(f)->i_private;
+	u32 hz;
+	int ret;
+
+	ret = kstrtou32_from_user(buf, n, 0, &hz);
+	if (ret)
+		return ret;
+	if (hz < 100 || hz > 4000)
+		return -EINVAL;
+
+	spin_lock(&v->lock);
+	v->clock_hz = hz;
+	spin_unlock(&v->lock);
+	dev_info(&v->pdev->dev, "[vgpu:dvfs] clock set to %u MHz\n", hz);
+	return n;
+}
+
+static const struct file_operations vgpu_dbg_clock_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.read	= vgpu_dbg_clock_read,
+	.write	= vgpu_dbg_clock_write,
+};
+
+/*
  * The per-device queue view: every live queue (any fd) with its engine,
  * priority, ring occupancy and per-queue counters — the driver-side
  * picture of what userspace calls streams.
@@ -145,11 +222,11 @@ static int vgpu_dbg_queues_show(struct seq_file *s, void *unused)
 	spin_lock_irqsave(&v->lock, flags);
 	list_for_each_entry(q, &v->queue_list, dev_node) {
 		seq_printf(s,
-			   "q#%u engine=%-8s prio=%u ring %u/%u B  sub=%llu done=%llu err=%llu%s\n",
+			   "q#%u engine=%-8s prio=%u ring %u/%u B  sub=%llu done=%llu err=%llu launches=%llu compute %llu ns%s\n",
 			   q->qid, vgpu_engine_names[q->engine], q->prio,
 			   q->ring_used, q->ring_size,
 			   q->stats_submitted, q->stats_completed,
-			   q->stats_errors,
+			   q->stats_errors, q->cs_launches, q->cs_time_ns,
 			   q->destroyed ? " (draining)" : "");
 	}
 	spin_unlock_irqrestore(&v->lock, flags);
@@ -366,6 +443,7 @@ static int vgpu_probe(struct platform_device *pdev)
 		goto err_devres;
 	}
 	v->pdev = pdev;
+	v->clock_hz = VGPU_REF_CLOCK_HZ;	/* DVFS starts at the reference */
 	spin_lock_init(&v->lock);
 	INIT_LIST_HEAD(&v->in_flight);
 	INIT_LIST_HEAD(&v->queue_list);
@@ -409,6 +487,17 @@ static int vgpu_probe(struct platform_device *pdev)
 		}
 	}
 
+	/*
+	 * Runtime PM: the device powers down after 2s idle (autosuspend)
+	 * and the next submission wakes it — the probe/remove and
+	 * get/put discipline is the lesson; QEMU has no real power domains,
+	 * the measurable thing is the wake cost, not the watts.
+	 */
+	pm_runtime_enable(&pdev->dev);
+	pm_runtime_set_autosuspend_delay(&pdev->dev, 2000);
+	pm_runtime_use_autosuspend(&pdev->dev);
+	pm_runtime_put_autosuspend(&pdev->dev);	/* idle until first submit */
+
 	/* per-engine workqueues + the bottom-half queue + watchdog */
 	vgpu_engine_init(v);
 
@@ -420,6 +509,7 @@ static int vgpu_probe(struct platform_device *pdev)
 	debugfs_create_file("pending", 0444, v->dbg, v, &vgpu_dbg_pending_fops);
 	debugfs_create_file("regs", 0444, v->dbg, v, &vgpu_dbg_regs_fops);
 	debugfs_create_file("vm", 0644, v->dbg, v, &vgpu_dbg_vm_fops);
+	debugfs_create_file("clock_hz", 0644, v->dbg, v, &vgpu_dbg_clock_fops);
 
 	ret = drm_dev_register(&v->dev, 0);
 	if (ret)
@@ -734,6 +824,15 @@ static void vgpu_remove(struct platform_device *pdev)
 
 	dev_info(&pdev->dev, "[vgpu:remove] draining and shutting down\n");
 
+	/*
+	 * Runtime PM teardown: stop the autosuspend first, then bring the
+	 * device back up if it powered down while idle — the resources we
+	 * are about to free must belong to an active device.
+	 */
+	pm_runtime_disable(&pdev->dev);
+	if (pm_runtime_suspended(&pdev->dev))
+		pm_runtime_resume(&pdev->dev);
+
 	vgpu_drain(v);
 	drm_dev_unregister(&v->dev);
 
@@ -766,6 +865,7 @@ static void vgpu_remove(struct platform_device *pdev)
 static struct platform_driver vgpu_platform_driver = {
 	.driver = {
 		.name = "vgpu",
+		.pm = &vgpu_pm_ops,
 	},
 	.probe = vgpu_probe,
 	.remove = vgpu_remove,
@@ -1567,6 +1667,8 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 	list_add_tail(&sub->node, &v->engine_pending[q->engine]);
 	spin_unlock_irqrestore(&v->lock, flags);
 
+	vgpu_pm_submit_begin(v);
+
 	queue_work(v->engine_wq[q->engine], &v->engine_work[q->engine]);
 	arg->seqno = sub->seqno;
 	return 0;
@@ -1835,6 +1937,8 @@ static int vgpu_cs_ioctl(struct drm_device *dev, void *data,
 		 q->qid, seqno, (unsigned long long)arg->ring_off,
 		 arg->ncmds);
 
+	vgpu_pm_submit_begin(v);
+
 	queue_work(v->engine_wq[q->engine], &v->engine_work[q->engine]);
 	arg->seqno = seqno;
 	return 0;
@@ -1929,6 +2033,28 @@ static int vgpu_query_ioctl(struct drm_device *dev, void *data,
 	arg->events = v->stats_events;
 	spin_unlock_irqrestore(&v->lock, flags);
 	return 0;
+}
+
+/*
+ * Take the device out of a power-gate for one submission. The get is
+ * what resumes it; if it was asleep we measure and log the wake cost —
+ * the only number a real power-management discussion can be had with.
+ * Balanced by vgpu_pm_submit_end() once the submission completes.
+ */
+static void vgpu_pm_submit_begin(struct vgpu *v)
+{
+	if (pm_runtime_suspended(&v->pdev->dev)) {
+		ktime_t t0 = ktime_get_ns();
+
+		pm_runtime_get_sync(&v->pdev->dev);
+		v->rpm_last_resume_ns = ktime_get_ns() - t0;
+		v->rpm_suspends++;
+		dev_info(&v->pdev->dev,
+			 "[vgpu:rpm] resumed for seq#%u in %llu us\n",
+			 v->next_seqno, v->rpm_last_resume_ns / 1000);
+	} else {
+		pm_runtime_get(&v->pdev->dev);
+	}
 }
 
 /* -------------------------------------------------------- module glue */

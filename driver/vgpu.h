@@ -460,6 +460,18 @@ struct vgpu {
 	u64 cs_instrs, cs_mem_ops, cs_waves;
 	u64 cs_coalesced_warps, cs_bcast_warps, cs_uncoalesced_warps;
 	u64 cs_mem_lat_ns;		/* modelled memory latency, ns */
+
+	/*
+	 * Phase I: runtime power management, DVFS and per-context
+	 * accounting. clock_hz is the engine clock in MHz (writable
+	 * debugfs knob); the compute engine's modelled memory latency
+	 * scales inversely with it, which is what DVFS means for kernel
+	 * time. rpm_* records the power-gate history: how many times the
+	 * device fell asleep and what the last wake cost.
+	 */
+	u32 clock_hz;
+	u32 rpm_suspends;
+	u64 rpm_last_resume_ns;
 	struct list_head kernel_list;	/* every live kernel (debugfs) */
 
 	/*
@@ -475,6 +487,10 @@ struct vgpu {
 /* phase D's SM geometry lives in vgpu_compute.c; the warp register
  * file above needs these two at struct-definition time. */
 #define VGPU_NREGS_MAX		16
+
+/* the compute engine's memory-latency model and its reference clock */
+#define VGPU_MEM_LAT_NS		40
+#define VGPU_REF_CLOCK_HZ	1000	/* the clock VGPU_MEM_LAT_NS is quoted at */
 
 /* how long the engine stalls on a WAIT_TIMELINE before giving up */
 #define VGPU_TIMELINE_WAIT_MS	2000

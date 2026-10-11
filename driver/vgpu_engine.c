@@ -23,6 +23,7 @@
 
 #include <linux/dma-fence.h>
 #include <linux/module.h>
+#include <linux/pm_runtime.h>
 #include <linux/workqueue.h>
 
 #include "vgpu.h"
@@ -666,6 +667,14 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 		sub->q->ring_used -= sub->ring_bytes;
 		v->scratch_used[sub->engine] -= sub->ncmds * VGPU_CMD_SIZE;
 		spin_unlock_irqrestore(&v->lock, flags);
+
+		/*
+		 * Phase I: this submission is done, so the device can sleep
+		 * again — mark_last_busy + put_autosuspend is the canonical
+		 * pair for vgpu_pm_submit_begin().
+		 */
+		pm_runtime_mark_last_busy(&v->pdev->dev);
+		pm_runtime_put_autosuspend(&v->pdev->dev);
 	}
 	kfree(sub);
 }

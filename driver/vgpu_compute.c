@@ -28,7 +28,21 @@
 
 #define VGPU_SM_COUNT		2	/* simulated SMs */
 #define VGPU_MAX_THREADS_SM	256	/* occupancy ceiling per SM */
-#define VGPU_MEM_LAT_NS		40	/* global-memory latency model */
+/* VGPU_MEM_LAT_NS / VGPU_REF_CLOCK_HZ live in vgpu.h (the driver uses them too) */
+
+/*
+ * DVFS in one line: the modelled memory latency is inversely
+ * proportional to the engine clock. Halve the clock and every kernel
+ * takes (about) twice as long — the whole point of a frequency governor,
+ * expressed as the number the compute engine accounts.
+ */
+static u32 vgpu_lat_ns(struct vgpu *v)
+{
+	if (!v->clock_hz)
+		return VGPU_MEM_LAT_NS;
+	return DIV_ROUND_UP((u64)VGPU_MEM_LAT_NS * VGPU_REF_CLOCK_HZ,
+			    v->clock_hz);
+}
 
 /*
  * Modelled per-block SM time. Not a sleep: a busy delay, exactly like
@@ -137,13 +151,13 @@ static enum vgpu_sched vgpu_run_warp(struct vgpu *v,
 			case VGPU_ISA_LD:
 				addr[lane] = R[in->a & (VGPU_NREGS - 1)] + in->b;
 				*d = vgpu_mem_word(sub, addr[lane], false, 0);
-				v->cs_mem_lat_ns += VGPU_MEM_LAT_NS / 8;
+				v->cs_mem_lat_ns += vgpu_lat_ns(v) / 8;	/* L1-hit share */
 				break;
 			case VGPU_ISA_ST:
 				addr[lane] = R[in->a & (VGPU_NREGS - 1)] + in->b;
 				vgpu_mem_word(sub, addr[lane], true,
 					      R[in->dst & (VGPU_NREGS - 1)]);
-				v->cs_mem_lat_ns += VGPU_MEM_LAT_NS;
+				v->cs_mem_lat_ns += vgpu_lat_ns(v);
 				break;
 			case VGPU_ISA_EXIT:
 				done[lane] = true;
