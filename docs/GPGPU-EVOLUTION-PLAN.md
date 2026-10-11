@@ -150,6 +150,14 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 - **面试故事**：UVM 到底是什么（对程序员是"统一地址",对驱动是缺页迁移）；为什么 GPU 的页错误处理和 CPU 的缺页同构。
 - **真实参照**：`Documentation/mm/hmm.rst`、`hmm_test`；NVIDIA `nvidia-uvm`。
 - **工作量**：4–5 天。**前置**：Phase C。
+- **已交付（本分支）**：`VGPU_PKT_LAUNCH_VA`（VA 命名 launch）+ `VGPU_VM_BIND_MANAGED`（标志负载化）
+  + 引擎侧逐访存走提交者页表、缺 PTE 走 phase C 的按需重映射并重放（`vgpu_vm_loan`）；
+  `engine vm faults` 计数器 + per-launch `va_faults`；`userspace/examples/uvm_saxpy.c`（驱逐后透明迁回、
+  结果全对、计数上升，连跑两轮）。**未做**：真 HMM/migrate_vma（我们的"host memory"就是 shmem 本身，
+  迁移是重装 PTE，物理搬运量恒为 0，所以 µs→ms 的延迟差在这台模拟器里没有对应物）；fault 时挂起 warp
+  交给独立 fault handler 再 replay（我们是同步服务：访存路径内 migration + 立即重试，语义等价、
+  少一层状态机）；`fault → migrate → pte_update → replay` 的 ftrace 四段式（迁移函数与 VM_COPY 共用，
+  trace 里看到的是同一条 `vgpu_vm_loan` → `vgpu_vm_map_range` 路径）。
 
 ### Phase F：调度与抢占（context timeslice + 寄存器保存/恢复）
 
@@ -264,7 +272,8 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | G | timeline semaphore / event / 图提交 | ✅ 已完成并 guest 验证 | `b19abbf` |
 | J | vgpu-smi-lite 观测工具 | ✅ 已完成并 guest 验证 | `a71f6ba` |
 | I | RPM / DVFS / per-context 计费 | ✅ 已完成并 guest 验证 | `28d6a3f` |
-| E, H | UVM 按需迁移 / fault containment | ⬜ 未开始（C 已落地，无阻塞） | — |
+| E | 统一虚拟内存：managed VA + 引擎侧按需迁移 | ✅ 已完成并 guest 验证 | 本分支 `phase/e-uvm` |
+| H | fault containment / fault buffer | ⬜ 未开始（C 已落地，无阻塞） | — |
 **已交付内容**：per-fd 多队列（每队列独立 ring + fence timeline + doorbell）、三个引擎（gfx/copy/compute）各自
 ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、7 指令教学 ISA +
 warp 同步执行器 + LAUNCH packet + MODULE_LOAD 模块注册 + broadcast/coalesced/strided 三类访存统计、
@@ -275,6 +284,17 @@ debugfs `queues`/`compute` 视图、`-q`/`-p`/saxpy 测试与 autorun 集成。
 re-map）、debugfs `vm` 视图（每 context 的 VA 区间状态 + budget/evicted/fault 计数器，可写 budget）。
 **实例**：`userspace/examples/saxpy.c`——CUDA SAXPY 的 vgpu 对应实现，4096 元素全对；
 入门/测试/trace/实例教学见 `docs/GETTING-STARTED.md`。
+
+**Phase E 新增**：`VGPU_PKT_LAUNCH_VA`——**VA 命名的 kernel launch**（`base_va` + `size`，不带 GEM handle），
+kernel 的 LD/ST 于是都是 GPU VA，逐个通过**提交者的页表**解析；`VGPU_VM_BIND_MANAGED` 终于有负载
+（只有 managed 区间允许被 VA 命名 launch 寻址）；`vgpu_vm_loan()`/`vgpu_vm_unloan()`——引擎侧借一页
+做一次访存，缺 PTE 就走 phase C 的按需重映射（**复用，非重写**）并把访问重放；计数器：
+`demand-faults`/`remapped`（phase C 的，引擎 fault 同样计入）+ compute 视图新增 `engine vm faults`
+（把"内核自己缺页"与"VA→VA DMA 缺页"分开）+ 每次 launch 的 `va_faults` 逐 kernel 统计。
+**实例**：`userspace/examples/uvm_saxpy.c`——与 saxpy **同一份 ISA 程序**，只把参数 buffer 从 handle
+命名换成 VA 命名：CPU 经 mmap 写 in[]、设备经页表读写的都是同一批 shmem 页，budget 压到 0 驱逐后
+launch，首次缺页即迁移回驻，结果全对且 fault 计数上升（连跑两轮证明是机制不是侥幸）；同一 buffer
+不带 `MANAGED` 标志再绑一次，VA 命名 launch 被 `-ENOENT` 拒绝（标志是承重墙）。
 
 **过程中抓到并修复的 4 个真 bug**（都有 guest 证据，写入各自 commit message）：
 1. 自旋锁内调可睡眠 API（`drm_gem_shmem_pin` 的页分配 + `set_pages_array`）
@@ -290,8 +310,8 @@ re-map）、debugfs `vm` 视图（每 context 的 VA 区间状态 + budget/evict
 7. VM_BIND 引用计数：`drm_gem_object_lookup` 的引用 + `drm_gem_object_get` 共拿了两个引用，unbind 只还一个，
    每个 bind 泄漏一个对象引用
 
-**下一步建议**：C（VMID/VA/页表+显存管理）与 A/B/D 无依赖，`~/self/wt/c` 工作树已就绪；
-E（UVM 迁移）依赖 C+D；F（抢占）依赖 D；G（同步/图）依赖 B；H（fault containment）依赖 C+D。
+**下一步建议**：C/E 已落地（E 用 VA 命名 launch + 引擎侧按需迁移补完了 UVM 的"迁移"半边）；
+剩下的 H（fault containment）只依赖 C+D，是最后一块未交付的机制。
 ## 10. 里程碑总览
 
 | 阶段 | 主题 | 工作量 | 面试故事 |

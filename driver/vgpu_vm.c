@@ -29,15 +29,32 @@
  *     back (demand paging), exactly how CPU swap pulls a page back in.
  *     TTM does this; UVM does it at a finer granularity.
  *
+ *  4. Phase E's unified memory: the same walk, driven by the compute
+ *     engine. A MANAGED range (VGPU_VM_BIND_MANAGED) is one address
+ *     space shared by the CPU and the device, so a kernel launched by
+ *     VGPU_PKT_LAUNCH_VA resolves every LD/ST through these tables via
+ *     vgpu_vm_loan(), and a page that is not resident is migrated back
+ *     in on the spot. That is the 缺页 model of a CPU applied to the
+ *     GPU, and it is the whole of what CUDA calls Unified Memory.
+ *
  * LAYERING NOTE (why this file is shaped the way it is):
  * everything that touches the page tables or the LRU takes v->vm_lock,
  * a mutex — not a spinlock, unlike v->lock. The walk allocates a PTE
  * page, and "BUG: Invalid wait Context" from sleeping inside a
- * spinlock is a bug this repo has already paid for once. What keeps
- * that honest is that nothing in the ENGINE ever touches these tables:
- * the engine obeys hardirq-like rules and runs on pages its doorbell
- * already resolved, so the only contexts here are ioctl process
- * contexts, where sleeping is fine.
+ * spinlock is a bug this repo has already paid for once.
+ *
+ * Phase C needed one thing to stay true for that: nothing in the
+ * ENGINE ever touched these tables, so every context here was an ioctl
+ * process context, where sleeping is fine. Phase E breaks that
+ * half-way, deliberately — the engine is now a legitimate client of
+ * the walk, because "the device faults and the driver migrates" IS the
+ * mechanism being taught. What keeps it safe is the very thing that
+ * made sleeping legal before: the engine is a workqueue (process)
+ * context, not a hardirq or softirq one, so a mutex is correct there
+ * too. And it never holds the lock across an access: vgpu_vm_loan()
+ * takes it, resolves ONE page, and hands it straight back, which is
+ * why a launch paused mid-warp (phase F) owns no page across its
+ * context switch.
  */
 
 #include <linux/highmem.h>
@@ -546,15 +563,17 @@ int vgpu_vm_bind(struct vgpu_file *vf, u64 va, u32 handle, u32 flags)
 
 	r->obj = &sh->base;
 	r->handle = handle;
+	r->managed = !!(flags & VGPU_VM_BIND_MANAGED);
 	v->stats_bound++;
 	vgpu_vm_evict_to_budget(v, r);
 	vmid = vf->vm->vmid;
 	mutex_unlock(&v->vm_lock);
 
 	dev_info(&v->pdev->dev,
-		 "[vgpu:vm] vmid %u: bound va 0x%llx + %llu B <- bo#%u (%s)\n",
+		 "[vgpu:vm] vmid %u: bound va 0x%llx + %llu B <- bo#%u (%s%s)\n",
 		 vmid, r->start, r->size, handle,
-		 r->mapped ? "resident" : "evicted, over VRAM budget");
+		 r->mapped ? "resident" : "evicted, over VRAM budget",
+		 r->managed ? ", managed" : "");
 	return 0;
 
 out_unlock:
@@ -604,13 +623,9 @@ void vgpu_vm_unbind(struct vgpu_file *vf, u64 va)
 /* ---------------------------------------------------------- the walk */
 
 /*
- * Resolve npages of GPU VA in this fd. On success the caller owns a
- * reference on the buffer and one on every page — the same "pin and
- * reference at submit" rule the BLIT path follows, and the reason a
- * concurrent unbind or eviction cannot pull the pages out from under
- * the engine.
- *
- * This is the phase's lesson in one function:
+ * Resolve npages of GPU VA in this VM — the whole of the page-table
+ * walk, in one function, and it is where phase C's demand migration
+ * lives:
  *
  *     va -> PDE index -> PTE page -> PTE index -> data page
  *
@@ -622,17 +637,29 @@ void vgpu_vm_unbind(struct vgpu_file *vf, u64 va)
  * freshly valid PTE. The fault counters make that observable, because
  * otherwise nobody could tell a working migration from a lucky
  * accident.
+ *
+ * On success the caller owns a reference on the buffer and one on every
+ * page, released with vgpu_vm_release().
+ *
+ * @migrated, when non-NULL, is set if the walk had to migrate the
+ * range back in — which is how a caller distinguishes "the page was
+ * already resident" from "the driver just fetched it". Phase E's
+ * engine-side faults care about exactly that difference.
  */
-int vgpu_vm_resolve(struct vgpu_file *vf, u64 va, u32 npages,
-		    struct drm_gem_object **objp, struct page **pages)
+static int vgpu_vm_walk(struct vgpu_vm *vm, u64 va, u32 npages,
+			struct drm_gem_object **objp, struct page **pages,
+			bool *migrated)
 {
-	struct vgpu *v = vf->vf_dev;
+	struct vgpu *v = vm->v;
 	struct vgpu_vm_range *r;
 	u32 i;
 	int ret = 0;
 
+	if (migrated)
+		*migrated = false;
+
 	mutex_lock(&v->vm_lock);
-	r = vf->vm ? vgpu_vm_range_find(vf->vm, va) : NULL;
+	r = vgpu_vm_range_find(vm, va);
 	if (!r || !r->obj ||
 	    va + (u64)npages * PAGE_SIZE > r->start + r->size) {
 		mutex_unlock(&v->vm_lock);
@@ -646,22 +673,24 @@ int vgpu_vm_resolve(struct vgpu_file *vf, u64 va, u32 npages,
 		 * is where "evicted to host" lands), so a service is a
 		 * PTE install and nothing else.
 		 */
-		ret = vgpu_vm_map_range(v, vf->vm, r, r->obj);
+		ret = vgpu_vm_map_range(v, vm, r, r->obj);
 		if (ret) {
 			mutex_unlock(&v->vm_lock);
 			return ret;
 		}
 		v->stats_vm_faults++;
 		v->stats_remap_pages += r->size >> PAGE_SHIFT;
+		if (migrated)
+			*migrated = true;
 		dev_info(&v->pdev->dev,
 			 "[vgpu:vm] vmid %u: fault va 0x%llx -> demand mapped "
 			 "%llu B back into VRAM\n",
-			 vf->vm->vmid, va, r->size);
+			 vm->vmid, va, r->size);
 	}
 
 	for (i = 0; i < npages; i++) {
 		u64 a = va + (u64)i * PAGE_SIZE;
-		u32 *ptes = vgpu_vm_pte_page(vf->vm, a, false);
+		u32 *ptes = vgpu_vm_pte_page(vm, a, false);
 		u32 pte;
 
 		if (IS_ERR_OR_NULL(ptes)) {
@@ -696,6 +725,96 @@ out_pages:
 		put_page(pages[i]);
 	mutex_unlock(&v->vm_lock);
 	return ret;
+}
+
+/*
+ * The ioctl-context entry point: an fd is what a memory access is
+ * tagged with (the VMID), so the doorbell resolves through this.
+ */
+int vgpu_vm_resolve(struct vgpu_file *vf, u64 va, u32 npages,
+		    struct drm_gem_object **objp, struct page **pages)
+{
+	struct vgpu_vm *vm = vgpu_vm_get(vf);
+
+	if (IS_ERR(vm))
+		return PTR_ERR(vm);
+	return vgpu_vm_walk(vm, va, npages, objp, pages, NULL);
+}
+
+/*
+ * Phase E: the compute engine's LD/ST resolution. Same walk, same
+ * migration, one page at a time, from the engine's own workqueue
+ * context (sleeping is fine there: vm_lock is a mutex, and nothing in
+ * the engine's hot path is under v->lock while this runs).
+ *
+ * Returning the page rather than the word is deliberate: the caller
+ * holds it for the duration of a single access and hands it straight
+ * back, so a launch paused mid-warp (phase F) owns no page, and a
+ * concurrent unbind or eviction cannot pull the pages out from under
+ * the engine mid-instruction.
+ */
+int vgpu_vm_loan(struct vgpu_vm *vm, u64 va, struct vgpu_va_page *out)
+{
+	struct drm_gem_object *obj = NULL;
+	struct page *page = NULL;
+	int ret;
+
+	out->obj = NULL;
+	out->page = NULL;
+	out->migrated = false;
+
+	ret = vgpu_vm_walk(vm, va & PAGE_MASK, 1, &obj, &page,
+			   &out->migrated);
+	if (ret)
+		return ret;
+	out->obj = obj;
+	out->page = page;
+	return 0;
+}
+
+void vgpu_vm_unloan(struct vgpu_va_page *out)
+{
+	if (!out->page)
+		return;
+	put_page(out->page);
+	drm_gem_object_put(out->obj);
+	out->page = NULL;
+	out->obj = NULL;
+}
+
+/*
+ * Phase E: a VA-named launch's range. The engine needs the pages, but
+ * it must not resolve them at submit time: the whole point of a managed
+ * range is that residency is decided LATER, by the access pattern. So
+ * all the doorbell does here is validate that the range is bound (and
+ * managed, if asked) and pin the buffer behind it for the submission's
+ * lifetime — the same "validate and pin at submit" rule everywhere
+ * else, minus the premature migration.
+ */
+int vgpu_vm_attach(struct vgpu_vm *vm, u64 va, u64 size, bool managed,
+		   struct drm_gem_object **objp)
+{
+	struct drm_gem_object *obj = NULL;
+	struct vgpu_vm_range *r;
+
+	mutex_lock(&vm->v->vm_lock);
+	r = vgpu_vm_range_find(vm, va);
+	/*
+	 * A reference, taken under vm_lock (it is a mutex, so a kref is
+	 * legal and unbind cannot free the object while we hold it);
+	 * the caller pins once it is out of here.
+	 */
+	if (r && r->obj && r->start == va && size <= r->size &&
+	    (!managed || r->managed)) {
+		drm_gem_object_get(r->obj);
+		obj = r->obj;
+	}
+	mutex_unlock(&vm->v->vm_lock);
+
+	if (!obj)
+		return -ENOENT;
+	*objp = obj;
+	return 0;
 }
 
 void vgpu_vm_release(struct drm_gem_object *obj, struct page **pages,
@@ -770,12 +889,14 @@ int vgpu_vm_show(struct seq_file *s, void *data)
 		seq_printf(s, "vmid %u: %u range(s), %llu B resident\n",
 			   vm->vmid, vm->nranges, vm->resident);
 		list_for_each_entry(r, &vm->ranges, node)
-			seq_printf(s, "  va 0x%llx-0x%llx %6lluK  %-9s  bo#%u\n",
+			seq_printf(s, "  va 0x%llx-0x%llx %6lluK  %-9s  bo#%u%s\n",
 				   r->start, r->start + r->size,
 				   r->size / 1024,
 				   !r->obj ? "reserved" :
 				   r->mapped ? "mapped" : "evicted",
-				   r->handle);
+				   r->handle,
+				   /* phase E: the unified-memory ones */
+				   r->managed ? "  managed" : "");
 		nvm++;
 	}
 	seq_printf(s, "contexts %u  bound %llu range(s)\n", nvm, v->stats_bound);
@@ -783,6 +904,14 @@ int vgpu_vm_show(struct seq_file *s, void *data)
 		   "evicted %llu  demand-faults %llu  remapped %llu pages\n",
 		   v->vram_budget, v->vram_resident, v->stats_evicted,
 		   v->stats_vm_faults, v->stats_remap_pages);
+	/*
+	 * Phase E: the split of those demand faults by who triggered
+	 * them. A VA->VA DMA also faults (phase C), so the engine-side
+	 * number is what says "a running kernel needed a page migrated
+	 * in", which is the number that matters when you are asking
+	 * whether unified memory is actually working.
+	 */
+	seq_printf(s, "compute: engine demand-faults %llu\n", v->cs_vm_faults);
 	mutex_unlock(&v->vm_lock);
 	return 0;
 }

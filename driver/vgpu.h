@@ -181,6 +181,26 @@ struct vgpu_submission {
 	u32 args_off;
 	u32 grid, block;
 	/*
+	 * Phase E: the VA-named launch (VGPU_PKT_LAUNCH_VA). The kernel's
+	 * global memory is the MANAGED range [launch_va, launch_va +
+	 * launch_size) in the submitting fd's address space, and every
+	 * LD/ST is resolved through that context's page tables — so the
+	 * submission has to carry the context itself, which is what the
+	 * engine (workqueue context, no fd) would otherwise have no way
+	 * to learn.
+	 *
+	 * @vm is BORROWED from vf->vm: the submission never outlives it,
+	 * because vgpu_postclose() flushes every engine workqueue before
+	 * destroying the fd's address space, and the rmmod path drains
+	 * first too (see vgpu_drain). Taking a reference on the object
+	 * behind the range is what keeps the PAGES alive, not the VM.
+	 */
+	struct vgpu_vm *vm;			/* the submitting fd's VM */
+	u64 launch_va;				/* 0: handle-named launch */
+	u64 launch_size;			/* bytes of the managed range */
+	struct drm_gem_object *va_obj;		/* its BO, pinned (like args) */
+	u32 va_faults;				/* demand faults this launch */
+	/*
 	 * phase F: the resumable launch state (NULL unless this submission
 	 * carries a LAUNCH). While a launch is paused it stays on the
 	 * in_flight list — its fence is NOT signaled, its ring bytes and
@@ -322,6 +342,14 @@ struct vgpu_kernel {
 /* The device's "VRAM" budget: a TTM-lite LRU, not a real allocator. */
 #define VGPU_VM_VRAM_BUDGET	(16ULL * 1024 * 1024)
 #define VGPU_VM_MAX_COPY_PAGES	64		/* 256K per VA copy */
+/*
+ * Phase E: the largest managed range a VA-named launch may name. A
+ * launch walks its tables on every LD/ST, so the ceiling is both a
+ * validation convenience and a statement that this is a teaching
+ * driver: 64 pages is 16K demands of headroom for a saxpy-sized
+ * argument buffer.
+ */
+#define VGPU_VM_MAX_MANAGED_PAGES	64
 
 /*
  * One buffer mapped into a VM: the driver-side record of "bo#N is at
@@ -337,6 +365,15 @@ struct vgpu_vm_range {
 	struct drm_gem_object *obj;	/* our reference (a handle's is its own) */
 	u32 handle;			/* the fd handle it was bound with */
 	bool mapped;			/* resident: PTEs installed */
+	/*
+	 * Phase E: bound with VGPU_VM_BIND_MANAGED. A managed range is
+	 * part of the context's unified address space, so it is the only
+	 * kind a VGPU_PKT_LAUNCH_VA may name: the kernel's LD/ST walk
+	 * these tables and fault a page back in, which is the migration
+	 * that makes "one address space for CPU and device" true rather
+	 * than a slogan.
+	 */
+	bool managed;
 };
 
 /*
@@ -443,8 +480,10 @@ struct vgpu {
 	 * A mutex and not a spinlock, unlike the other locks here:
 	 * walking the tables can allocate a PTE page, and the fix for the
 	 * sleeping-in-spinlock bug in this repo's history is to not be in
-	 * one. No engine context ever touches these tables — the engine
-	 * runs on pages the submitter already resolved.
+	 * one. Phase E made the compute engine a client of the walk (see
+	 * vgpu_vm_loan): that is safe precisely because an engine is a
+	 * workqueue context, where sleeping is legal, and it takes the
+	 * lock for one page at a time rather than for a whole launch.
 	 */
 	struct mutex vm_lock;
 	struct list_head vm_list;	/* every live struct vgpu_vm */
@@ -455,6 +494,15 @@ struct vgpu {
 	u64 stats_vm_faults;		/* VAs resolved through a demand re-map */
 	u64 stats_remap_pages;		/* pages re-installed by those faults */
 	u64 stats_bound;		/* ranges bound since boot */
+	/*
+	 * Phase E: demand faults serviced by the COMPUTE engine, i.e. a
+	 * kernel's own LD/ST finding a non-resident page and the driver
+	 * migrating it in. They also bump phase C's stats_vm_faults (the
+	 * migration is the same code path) — this counter is the
+	 * engine-side view of it, so a debugfs reader can tell a VA->VA
+	 * DMA that faulted from a kernel that faulted.
+	 */
+	u64 cs_vm_faults;
 	/* compute statistics (debugfs "compute") */
 	u64 cs_kernels_launched, cs_blocks, cs_warps, cs_threads;
 	u64 cs_instrs, cs_mem_ops, cs_waves;
@@ -518,6 +566,34 @@ void vgpu_vm_unbind(struct vgpu_file *vf, u64 va);
  */
 int vgpu_vm_resolve(struct vgpu_file *vf, u64 va, u32 npages,
 		    struct drm_gem_object **objp, struct page **pages);
+/*
+ * Phase E: one word of GPU VA, through the tables, for the compute
+ * engine. Resolves the page (faulting it back in if it is not
+ * resident), takes references on the page and on the buffer behind it,
+ * and reports whether the access needed a migration. The caller touches
+ * @page and then returns it with vgpu_vm_unloan() — the "loan" is
+ * exactly as long as one LD/ST, which is why a launch can be paused
+ * and resumed (phase F) without holding a page across a context
+ * switch.
+ */
+struct vgpu_va_page {
+	struct drm_gem_object *obj;	/* the range's buffer, referenced */
+	struct page *page;		/* referenced: the word lives here */
+	bool migrated;			/* the driver just migrated it in */
+};
+int vgpu_vm_loan(struct vgpu_vm *vm, u64 va, struct vgpu_va_page *out);
+void vgpu_vm_unloan(struct vgpu_va_page *out);
+
+/*
+ * Phase E: attach to the range at [va, va + size) so a VA-named launch
+ * can pin the buffer behind it for its lifetime. Validates that the
+ * range is bound, and — when @managed is asked for — that it was bound
+ * with VGPU_VM_BIND_MANAGED. Unlike vgpu_vm_resolve() this does NOT
+ * walk the PTEs and does NOT fault anything in: a managed launch
+ * faults lazily, from the engine, on first touch.
+ */
+int vgpu_vm_attach(struct vgpu_vm *vm, u64 va, u64 size, bool managed,
+		   struct drm_gem_object **objp);
 void vgpu_vm_release(struct drm_gem_object *obj, struct page **pages,
 		     u32 npages);
 void vgpu_vm_release_sub(struct vgpu_submission *sub);

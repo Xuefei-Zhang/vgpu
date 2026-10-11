@@ -41,7 +41,7 @@ scripts/30-run.sh          # ③ 起 guest；autorun 存在时开机自动跑全
 
 ### 2.1 一键全测（开机自动）
 
-`autorun` 标记存在时，guest 启动后 `/root/run_test.sh` 依次跑六个阶段：
+`autorun` 标记存在时，guest 启动后 `/root/run_test.sh` 依次跑各阶段：
 
 | 阶段 | 命令 | 验证什么 |
 |---|---|---|
@@ -50,6 +50,10 @@ scripts/30-run.sh          # ③ 起 guest；autorun 存在时开机自动跑全
 | 多引擎多队列 | `/root/vgpu_test -q` | 一个 fd 三条流绑三个引擎；引擎类别在门铃处被拒 |
 | **计算：SAXPY** | `/root/saxpy` | kernel launch 全流程（本档 §5 的实例） |
 | 负路径 | `/root/vgpu_test -e` | 未知 seqno/坏 handle/引擎级错误/ring 满/门铃坏输入 |
+| 时间片/抢占 | `/root/vgpu_test -f` | 两个 context 时间片轮转、高优先级抢下在跑的 kernel |
+| 同步/图 | `/root/vgpu_test -g` | timeline semaphore、DAG 一次门铃 |
+| 虚拟内存 | `/root/vgpu_test -v` | 两个 context 同一 VA 各自 buffer、按需重映射 |
+| **统一内存** | `/root/uvm_saxpy` | managed VA 被引擎逐访存解析、缺页即迁回（本篇 §6） |
 | ftrace + stats + rmmod | 脚本内 | 函数图抓取、debugfs 统计、rmmod drain 干净 |
 
 **判定标准**：日志出现 `=== all tests passed ===`，且 `dmesg` 里**没有** WARNING / KASAN / BUG。
@@ -66,10 +70,12 @@ guest 的 `~ #` 下：
 /root/vgpu_test -p        # packet 门铃两批提交
 /root/vgpu_test -e        # 负路径
 /root/saxpy               # 计算示例（SAXPY）
+/root/uvm_saxpy           # 统一内存示例（managed VA + 按需迁移）
 
 cat /sys/kernel/debug/vgpu/stats      # 提交/完成/错误 + 每引擎 scratch 与 backlog
 cat /sys/kernel/debug/vgpu/queues     # 每条队列：引擎/优先级/ring 占用/计数
-cat /sys/kernel/debug/vgpu/compute    # 计算统计：warps/threads/waves/合并率
+cat /sys/kernel/debug/vgpu/compute    # 计算统计：warps/threads/waves/合并率 + 引擎侧缺页数
+cat /sys/kernel/debug/vgpu/vm         # 每 context 的 VA 区间/budget/逐页/存留 + demand-faults
 cat /sys/kernel/debug/vgpu/pending    # 在飞 submission
 cat /sys/kernel/debug/vgpu/regs       # 虚拟 BAR0 当前值
 ```
@@ -299,18 +305,62 @@ coalesced）= 每 warp 6 次访存全部**单事务**。把 `code[]` 里第 7 �
 
 ---
 
-## 6. 排障
+## 6. 实例二：统一内存（managed VA + 按需迁移）
+
+SAXPY 把参数 buffer 用 **GEM handle** 命名（`launch.args_bo`）；phase E 增加了一种命名方式：
+**GPU 虚拟地址**（`VGPU_PKT_LAUNCH_VA`）。`userspace/examples/uvm_saxpy.c` 与 `saxpy.c` 用的是**同一份
+ISA 程序**，差别只在 packet 里那个字段：
+
+```c
+pk->type = VGPU_PKT_LAUNCH_VA;   /* 不是 VGPU_PKT_LAUNCH */
+pk->launch_va.kid     = ml.kid;
+pk->launch_va.base_va = va;      /* VM_ALLOC 拿到的地址，page 对齐 */
+pk->launch_va.size    = ARGS_BYTES;
+```
+
+配套的两步（这就是 CUDA `cudaMallocManaged` 在 vgpu 的对应物）：
+
+```c
+struct vgpu_vm_alloc a = { .size = ARGS_BYTES };
+ioctl(fd, DRM_IOCTL_VGPU_VM_ALLOC, &a);        /* a.va: 我的 context 的一个 VA */
+struct vgpu_vm_bind b = { .va = a.va, .bo_handle = bo.handle,
+                          .flags = VGPU_VM_BIND_MANAGED };   /* 关键：managed */
+ioctl(fd, DRM_IOCTL_VGPU_VM_BIND, &b);
+```
+
+之后**每一个** LD/ST 都走这个 fd 的页表：命中就直接访问，缺 PTE 就走 phase C 的按需重映射把区间迁回
+驻留、再把这次访问重放。kernel 完全不知道刚才发生过缺页——这就是 Unified Memory 对程序员的样子
+（对驱动就是"缺页迁移"，和 CPU swap 同构）。
+
+示例的做法是把证据逼出来：budget 通过可写 debugfs 压到 0（区间被驱逐）→ launch → 首次访存缺页迁回 →
+校验 out[] 全对 → 断言 `demand-faults` / `engine vm faults` 计数上涨 → 再来一轮。典型输出：
+
+```
+[vgpu:vm] vmid 1: fault va 0x1000 -> demand mapped 20480 B back into VRAM
+[vgpu:uvm] seq#39: 1 demand fault(s) on va 0x1000 + 20480 B (migrated in mid-kernel)
+PASS: round 1: 1 range(s) evicted, 1 demand fault(s) serviced mid-kernel, 5 page(s) remapped, 1 engine fault(s)
+PASS: unified memory — the device reached va 0x1000 after its pages were evicted, transparently (2048 elements verified...)
+PASS: the same buffer bound WITHOUT VGPU_VM_BIND_MANAGED rejects a VA-named launch (-ENOENT)
+```
+
+最后一行是这条机制的边界：不带 `MANAGED` 标志绑的同一个 buffer 不是统一内存，VA 命名 launch 寻址它
+会在门铃处被 `-ENOENT` 拒绝——"没声明 managed 的地址是 fault，不是巧合"。
+
+---
+
+## 7. 排障
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | `open /dev/dri/*: No such device` | 模块没加载 / 节点没建 | `insmod /root/vgpu.ko` + 用 sysfs 的 dev 号 `mknod` |
-| `doorbell: -EINVAL` | put 未 40B 对齐 / 没前进 / 越界 / block 不是 32 倍数 / kid 不存在 | 看 §5.5 的校验清单 |
+| `doorbell: -EINVAL` | put 未 40B 对齐 / 没前进 / 越界 / block 不是 32 倍数 / kid 不存在 / VA 未 page 对齐或越界 | 看 §5.5 的校验清单 |
+| `doorbell: -ENOENT` | VA 命名 launch 寻址的区间没绑、或没带 `MANAGED` 标志绑 | 看 §6；PROBE/隔离用 `vm` 视图确认区间状态 |
 | `wait: -ETIMEDOUT` | engine 卡住或超时太短 | 查 `pending`；ring 满会 `-EBUSY` |
 | `wait: -22 (-EINVAL)` | engine 级错误（如错位 SET） | `dmesg` 里 `[vgpu:engine] ... ERROR` |
 | KASAN 报告 | 真 bug（本 repo 的规矩：先看现场再改） | 用 FTRACE-GUIDE 的 `func_stack_trace` / gdb |
 | autootest 停在某阶段 | 该阶段 FAIL | 从第一个 FAIL 往上读；guest shell 还在 |
 
-## 7. 文档导航
+## 8. 文档导航
 
 | 想知道 | 去看 |
 |---|---|

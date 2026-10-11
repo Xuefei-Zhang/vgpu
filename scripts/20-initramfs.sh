@@ -21,6 +21,7 @@ done
 cp "$ROOT/driver/vgpu.ko" "$INITDIR/root/"
 cp "$ROOT/userspace/vgpu_test" "$INITDIR/root/"
 [ -f "$ROOT/userspace/examples/saxpy" ] && cp "$ROOT/userspace/examples/saxpy" "$INITDIR/root/"
+[ -f "$ROOT/userspace/examples/uvm_saxpy" ] && cp "$ROOT/userspace/examples/uvm_saxpy" "$INITDIR/root/"
 cp "$ROOT/userspace/examples/vgpu_smi" "$INITDIR/root/"
 # autorun marker (if present next to the scripts) triggers the test on boot
 [ -f "$ROOT/autorun" ] && touch "$INITDIR/root/autorun"
@@ -122,6 +123,12 @@ echo "=== phase C: GPU virtual memory (VMID isolation + VRAM budget) ==="
 /root/vgpu_test -v || exit 1
 echo "--- vm view: per-context VA ranges, budget, evictions ---"
 cat /sys/kernel/debug/vgpu/vm
+echo "=== phase E: unified memory (managed VA + demand migration) ==="
+/root/uvm_saxpy || exit 1
+echo "--- vm view after the managed range was faulted back in ---"
+cat /sys/kernel/debug/vgpu/vm
+echo "--- engine-side demand faults (debugfs compute) ---"
+grep 'vm faults' /sys/kernel/debug/vgpu/compute
 echo "=== phase I: runtime PM, DVFS clock, per-context accounting ==="
 /root/vgpu_test -i || exit 1
 echo "--- dvfs/rpm view (debugfs stats) ---"

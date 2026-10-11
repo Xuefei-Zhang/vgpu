@@ -212,6 +212,11 @@ struct vgpu_graph_submit {
  *   + VM_BIND         ->  the device can now dereference that VA
  *   VGPU_PKT_VM_COPY  ->  the walk happens, per page
  *
+ * Phase E keeps that and adds the managed (unified-memory) half: bind
+ * with VGPU_VM_BIND_MANAGED and launch with VGPU_PKT_LAUNCH_VA, and the
+ * kernel's every LD/ST is a GPU VA walked through this fd's tables,
+ * with a non-resident page migrated in on demand.
+ *
  * Choosing handle-vs-VA is the point: the SAME address in two processes
  * translatesto different memory because each VMID has its own tables,
  * and an address nobody bound is a fault, not garbage.
@@ -224,9 +229,33 @@ struct vgpu_vm_alloc {
 	__u32 pad;
 };
 
+/*/
+ * Phase E's MANAGED bind flag — and the first UAPI flag userspace has
+ * to spell, which is why BIT() is defined here: it is a kernel macro
+ * (linux/bits.h) and libdrm's drm.h does not carry it, so a userspace
+ * build of this header would otherwise fail to expand the one flag it
+ * needs. 1UL matches the kernel's definition closely enough for a
+ * flag word.
+ */
+#ifndef BIT
+#define BIT(nr)		(1UL << (nr))
+#endif
+
 /* flags: bit0 = managed (UVM-lite demand migration, phase E). */
 #define VGPU_VM_BIND_MANAGED	BIT(0)
 
+/*/
+ * A bind made MANAGED declares that the range is part of this
+ * context's UNIFIED address space: the CPU reaches it through the BO's
+ * mmap and the device reaches it by VA, and neither side knows or cares
+ * which pages are currently resident. That is the whole contract of
+ * CUDA Unified Memory, and what makes it more than a flag is the other
+ * half of phase E: a VGPU_PKT_LAUNCH_VA naming this range has every
+ * LD/ST resolved through this fd's page tables, with a non-resident
+ * page migrated in on the spot. A range bound WITHOUT the flag is
+ * ordinary device memory — reachable by handle (a plain LAUNCH packet)
+ * or by a VA->VA DMA, but never faulted in for a kernel.
+ */
 struct vgpu_vm_bind {
 	__u64 va;		/* in, a VA returned by VM_ALLOC */
 	__u32 bo_handle;	/* in, the GEM handle to attach there */
@@ -316,6 +345,25 @@ enum vgpu_packet_type {
 	 * isolation observable: the driver walks THAT fd's tables.
 	 */
 	VGPU_PKT_VM_COPY		= 7,
+	/*/
+	 * Phase E: a kernel launch whose global memory is a MANAGED range
+	 * of GPU VIRTUAL ADDRESSES, addressed by VA instead of by GEM
+	 * handle. The kernel's LD/ST operands are then word indices
+	 * relative to this packet's base_va, and EVERY one of them is
+	 * resolved through the submitting context's page tables — which
+	 * is what "unified memory" means to the driver: one address space
+	 * for the CPU and the device, and a page that is not resident is
+	 * migrated in on demand, exactly like a CPU page fault.
+	 *
+	 * It is a separate packet type rather than a flag on LAUNCH
+	 * because the operand sets are disjoint: LAUNCH names a BO handle
+	 * (a pool buffer the device addresses by object), LAUNCH_VA names
+	 * a byte range in an address space. Keeping both means phase D's
+	 * handle-named launches (saxpy, phase G's graph nodes) keep
+	 * working untouched, which is the point of adding a variant
+	 * instead of changing the one everybody uses.
+	 */
+	VGPU_PKT_LAUNCH_VA		= 8,
 };
 
 struct vgpu_packet {
@@ -337,9 +385,12 @@ struct vgpu_packet {
 		 * for every kernel launch (grid/block dims, the argument
 		 * buffer, the kernel to run). The argument buffer is
 		 * named by a GEM handle: it is a pool buffer, and the
-		 * phase-C way to address one by GPU VA is VM_BIND +
-		 * VGPU_PKT_VM_COPY, which is the path that has to go
-		 * through the submitter's page tables.
+		 * device addresses it by object.
+		 *
+		 * Phase E added the VA-named twin below (LAUNCH_VA) for
+		 * the managed case; this one stays the handle-named
+		 * baseline, which is what the saxpy example and phase G's
+		 * graph nodes use.
 		 */
 		struct {
 			__u32 kid;	/* kernel id (VGPU_MODULE_LOAD) */
@@ -349,6 +400,26 @@ struct vgpu_packet {
 			__u32 args_off;	/* byte offset of the args inside it */
 			__u32 pad[3];
 		} launch;
+		/*/
+		 * Phase E: the VA-named launch. The argument buffer is a
+		 * MANAGED range in the submitting context's address space
+		 * (VM_ALLOC + VM_BIND with VGPU_VM_BIND_MANAGED), so there
+		 * is no handle to carry: base_va is where word 0 of the
+		 * kernel's global memory lives, and size is how many
+		 * bytes of it are addressable. The engine resolves every
+		 * LD/ST against base_va through that fd's page tables and
+		 * faults a non-resident page back in — the same migration
+		 * phase C's demand re-map performs, triggered by the
+		 * compute engine rather than by a VA->VA DMA.
+		 */
+		struct {
+			__u32 kid;	/* kernel id (VGPU_MODULE_LOAD) */
+			__u32 grid;	/* blocks in the grid */
+			__u32 block;	/* threads per block (<= 256) */
+			__u64 base_va;	/* page-aligned VA of word 0 */
+			__u32 size;	/* bytes of the managed range */
+			__u32 pad;
+		} launch_va;
 		/*/
 		 * Phase G sync operands: which word of the bound
 		 * semaphore page, and the value. The handle is carried

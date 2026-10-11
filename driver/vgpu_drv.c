@@ -269,6 +269,16 @@ static int vgpu_dbg_compute_show(struct seq_file *s, void *unused)
 	seq_printf(s, "strided warps      %llu / %llu\n",
 		   v->cs_uncoalesced_warps, v->cs_warps);
 	seq_printf(s, "modelled mem latency %llu ns\n", v->cs_mem_lat_ns);
+	/*
+	 * Phase E: demand faults serviced BY THE COMPUTE ENGINE — a
+	 * kernel's LD/ST landing on a page that was not resident and the
+	 * driver migrating it in. They also count in the "vm" view's
+	 * demand-faults (the migration is the same code), so this is the
+	 * engine-side split: it is the number that says a running kernel
+	 * needed its memory, which is what "unified memory working"
+	 * looks like.
+	 */
+	seq_printf(s, "engine vm faults   %llu\n", v->cs_vm_faults);
 
 	/*
 	 * phase F: the scheduler's view of the compute engine. ctx
@@ -540,6 +550,7 @@ u32 vgpu_pkt_opcode(u32 type)
 	case VGPU_PKT_COPY:		return VGPU_OP_BLIT;
 	case VGPU_PKT_WRITE_REG:	return VGPU_OP_SET;
 	case VGPU_PKT_LAUNCH:		return VGPU_OP_LAUNCH;
+	case VGPU_PKT_LAUNCH_VA:	return VGPU_OP_LAUNCH;	/* same opcode */
 	case VGPU_PKT_SIGNAL_TIMELINE:	return VGPU_OP_SIGNAL_TIMELINE;
 	case VGPU_PKT_WAIT_TIMELINE:	return VGPU_OP_WAIT_TIMELINE;
 	case VGPU_PKT_WRITE_EVENT:	return VGPU_OP_WRITE_EVENT;
@@ -1487,6 +1498,50 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 			break;
 		}
 		/*
+		 * Phase E: the VA-named twin. It carries no handle, so
+		 * there is nothing to look up — instead the validating
+		 * half is that the range is a legal managed range in
+		 * THIS fd's address space, which the second pass checks
+		 * (vgpu_vm_attach) before the engine ever sees it. Note
+		 * what is NOT here: no page-table walk. A managed range
+		 * faults lazily, on first touch, from the engine.
+		 */
+		case VGPU_PKT_LAUNCH_VA: {
+			u32 kid = p->launch_va.kid;
+
+			if (!vf->vm) {
+				ret = -ENOENT;	/* no address space yet */
+				goto err_unmap;
+			}
+			kernel = vgpu_kernel_find(vf, kid);
+			if (!kernel ||
+			    !vgpu_engine_allows(q->engine, VGPU_OP_LAUNCH) ||
+			    nlaunches++ ||
+			    p->launch_va.block > 256 ||
+			    p->launch_va.block % 32 ||
+			    p->launch_va.grid < 1 ||
+			    p->launch_va.base_va % PAGE_SIZE ||
+			    p->launch_va.size == 0 ||
+			    p->launch_va.size % PAGE_SIZE ||
+			    p->launch_va.size >
+			    VGPU_VM_MAX_MANAGED_PAGES * PAGE_SIZE) {
+				ret = -EINVAL;
+				goto err_unmap;
+			}
+			sub->kernel = kernel;
+			sub->grid = p->launch_va.grid;
+			sub->block = p->launch_va.block;
+			sub->vm = vf->vm;
+			sub->launch_va = p->launch_va.base_va;
+			sub->launch_size = p->launch_va.size;
+			sub->cs = kzalloc(sizeof(*sub->cs), GFP_KERNEL);
+			if (!sub->cs) {
+				ret = -ENOMEM;
+				goto err_unmap;
+			}
+			break;
+		}
+		/*
 		 * Phase G: the memory-semantics vocabulary. Validated
 		 * here, resolved (handle -> pinned object) below — the
 		 * engine must never touch a handle.
@@ -1566,6 +1621,30 @@ static int vgpu_doorbell_ioctl(struct drm_device *dev, void *data,
 			if (ret) {
 				drm_gem_object_put(sub->args_obj);
 				sub->args_obj = NULL;
+				goto err_unmap;
+			}
+			continue;
+		}
+		/*
+		 * Phase E: the managed range behind a VA-named launch.
+		 * Same "pin for the submission's lifetime" rule as the
+		 * handle-named buffer above, and the same reason: the
+		 * engine will be dereferencing these pages with nothing
+		 * but a page-table entry between it and freed memory.
+		 * What is deliberately NOT done here is the walk itself
+		 * — a managed range's residency is decided by the
+		 * access pattern, not by the doorbell.
+		 */
+		if (p->type == VGPU_PKT_LAUNCH_VA) {
+			ret = vgpu_vm_attach(sub->vm, sub->launch_va,
+					     sub->launch_size, true,
+					     &sub->va_obj);
+			if (ret)
+				goto err_unmap;
+			ret = drm_gem_shmem_pin(to_drm_gem_shmem_obj(sub->va_obj));
+			if (ret) {
+				drm_gem_object_put(sub->va_obj);
+				sub->va_obj = NULL;
 				goto err_unmap;
 			}
 			continue;
@@ -1692,6 +1771,12 @@ err_unmap:
 		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
 		drm_gem_object_put(sub->args_obj);
 		sub->args_obj = NULL;
+	}
+	/* phase E: the managed range a rejected batch may have pinned */
+	if (sub->va_obj) {
+		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->va_obj));
+		drm_gem_object_put(sub->va_obj);
+		sub->va_obj = NULL;
 	}
 	kfree(sub->cs);		/* NULL-safe: no LAUNCH in a rejected batch */
 	kfree(sub);

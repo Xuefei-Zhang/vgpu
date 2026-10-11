@@ -4,7 +4,7 @@
 CC ?= gcc
 CFLAGS := -O2 -Wall -Wextra -static -I../driver/uapi -I/usr/include/libdrm
 
-all: vgpu_test examples/saxpy examples/vgpu_smi
+all: vgpu_test examples/saxpy examples/vgpu_smi examples/uvm_saxpy
 
 vgpu_test: vgpu_test.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -15,7 +15,11 @@ examples/saxpy: examples/saxpy.c
 examples/vgpu_smi: examples/vgpu_smi.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+# phase E: the handle-named saxpy re-run over a MANAGED VA range
+examples/uvm_saxpy: examples/uvm_saxpy.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 clean:
-	rm -f vgpu_test examples/saxpy examples/vgpu_smi
+	rm -f vgpu_test examples/saxpy examples/vgpu_smi examples/uvm_saxpy
 
 .PHONY: all clean

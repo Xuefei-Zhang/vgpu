@@ -34,9 +34,10 @@ scripts/30-run.sh          # 3) 启动 KVM guest；/init 自动 insmod，autorun
 ```
 
 guest 内手动跑：`/root/vgpu_test`（单进程全链路）、`/root/vgpu_test -m 4`（4 进程并发）、
-`/root/vgpu_test -e`（负路径）。代码树里 `touch autorun` 后重新打包即可开机自动测试。
+`/root/vgpu_test -e`（负路径）、`/root/saxpy`（计算）、`/root/uvm_saxpy`（统一内存）。
+代码树里 `touch autorun` 后重新打包即可开机自动测试。
 
-测试覆盖六个阶段，全部通过（摘自我机器上最近一次真实运行，非示意）：
+测试覆盖全部阶段，全部通过（摘自我机器上最近一次真实运行，非示意）：
 
 ```
 === single process full chain ===

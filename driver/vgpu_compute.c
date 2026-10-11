@@ -20,6 +20,14 @@
  * pull to make a shader stop — and, when told to yield, saves the
  * cursor (block/warp/pc) plus the register file into sub->cs so the
  * engine can run somebody else's kernel and later resume this one.
+ *
+ * Phase E adds unified memory: a launch whose global memory is a
+ * MANAGED range in the submitting context's address space
+ * (VGPU_PKT_LAUNCH_VA) has every LD/ST resolved through that fd's page
+ * tables, and a page that is not resident is migrated in on the spot
+ * (see vgpu_mem_word). The ISA is untouched — a kernel's addresses are
+ * word indices either way; what changes is what they are an index
+ * INTO: a pinned object, or an address space shared with the CPU.
  */
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -55,16 +63,63 @@ static u32 vgpu_lat_ns(struct vgpu *v)
 #define R(i)			regs[(i) & (VGPU_NREGS - 1)]
 
 /*
- * One global-memory word, through the argument BO's pages. The BO is
- * pinned for the submission's lifetime (the doorbell does it, like a
- * real driver pins before a launch); each access still resolves its
- * page — which is exactly the walk a GPU's memory management unit
- * performs, and the reason a multi-page argument buffer needs a page
- * table at all.
+ * One global-memory word. There are two shapes, because a kernel's
+ * global memory can be named two honest ways and phase E added the
+ * second one without disturbing the first:
+ *
+ *   handle-named (VGPU_PKT_LAUNCH, phase D) — the argument BO, word
+ *     addressed. It was resolved once at submit time and pinned for
+ *     the launch's lifetime; each access still resolves its page,
+ *     which is the walk a GPU's memory management unit performs and
+ *     the reason a multi-page argument buffer needs a page table at
+ *     all.
+ *
+ *   VA-named (VGPU_PKT_LAUNCH_VA, phase E) — a MANAGED range in the
+ *     SUBMITTING CONTEXT's address space. Every access is a GPU VA,
+ *     so it goes through that fd's page tables, and a page that is not
+ *     resident is migrated in on the spot: the engine faults, the
+ *     driver services the fault by re-installing the PTEs (phase C's
+ *     demand re-map, reused, not reimplemented), and the access
+ *     retries into the page that is now there. The kernel itself does
+ *     not know any of this happened — that is the whole of Unified
+ *     Memory from the programmer's side.
+ *
+ * The page is borrowed for the duration of one access, which is what
+ * keeps phase F honest: a launch paused mid-warp owns no page, so a
+ * context switch cannot leave a stranded reference behind.
  */
 static u32 vgpu_mem_word(struct vgpu_submission *sub, u32 addr, bool write,
 			 u32 val)
 {
+	if (sub->launch_va) {
+		u64 va = sub->launch_va + (u64)addr * sizeof(u32);
+		struct vgpu_va_page pg = {};
+		u32 *p;
+		int ret;
+
+		if (va + sizeof(u32) > sub->launch_va + sub->launch_size) {
+			/* outside the managed range: a fault, not garbage */
+			sub->error = -ENOENT;
+			return 0;
+		}
+		ret = vgpu_vm_loan(sub->vm, va, &pg);
+		if (ret) {
+			sub->error = ret;
+			return 0;
+		}
+		if (pg.migrated) {
+			sub->va_faults++;
+			sub->v->cs_vm_faults++;
+		}
+		p = kmap_local_page(pg.page) + (va & (PAGE_SIZE - 1));
+		if (write)
+			*p = val;
+		else
+			val = *p;
+		kunmap_local(p);
+		vgpu_vm_unloan(&pg);
+		return val;
+	}
 	return vgpu_bo_word(sub->args_obj, addr, write, val);
 }
 
@@ -301,6 +356,22 @@ enum vgpu_sched vgpu_compute_run(struct vgpu *v, struct vgpu_submission *sub)
 			sub->q->cs_launches++;
 			spin_unlock_irqrestore(&v->lock, flags);
 		}
+		/*
+		 * Phase E's per-launch number: how many times THIS kernel
+		 * touched a page that was not resident and the driver
+		 * migrated it in under it. Cheap (one u32), and it is the
+		 * per-kernel view of the same thing the "compute"
+		 * debugfs view counts device-wide — UVM's per-process
+		 * fault statistics, which is what tells you whether a
+		 * kernel is thrashing or whether it faulted once and then
+		 * hit.
+		 */
+		if (sub->va_faults)
+			dev_info(&v->pdev->dev,
+				 "[vgpu:uvm] seq#%u: %u demand fault(s) on va "
+				 "0x%llx + %llu B (migrated in mid-kernel)\n",
+				 sub->seqno, sub->va_faults, sub->launch_va,
+				 sub->launch_size);
 		kfree(cs->fw);
 		cs->fw = NULL;
 	}

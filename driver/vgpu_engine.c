@@ -181,6 +181,16 @@ static void vgpu_fetch_packets(struct vgpu *v, struct vgpu_submission *sub)
 			c->opcode = VGPU_OP_LAUNCH;
 			break;
 		/*
+		 * Phase E: the VA-named twin decodes to the very same
+		 * opcode — the difference is entirely in what the
+		 * submission carries (a managed VA range instead of a
+		 * pinned argument BO), which was resolved at doorbell
+		 * time, not in the ring.
+		 */
+		case VGPU_PKT_LAUNCH_VA:
+			c->opcode = VGPU_OP_LAUNCH;
+			break;
+		/*
 		 * Phase G: the sync packets carry no engine-side state
 		 * beyond which word of the semaphore page and what
 		 * value — the command struct's SET fields are exactly
@@ -615,6 +625,17 @@ void vgpu_finish_submission(struct vgpu *v, struct vgpu_submission *sub)
 		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->args_obj));
 		drm_gem_object_put(sub->args_obj);
 		sub->args_obj = NULL;
+	}
+	/*
+	 * Phase E: the managed range behind a VA-named launch. The
+	 * submission borrowed the submitting fd's VM (it cannot outlive
+	 * it — vgpu_postclose drains the engines before destroying the
+	 * address space), so only the buffer needs giving back.
+	 */
+	if (sub->va_obj) {
+		drm_gem_shmem_unpin(to_drm_gem_shmem_obj(sub->va_obj));
+		drm_gem_object_put(sub->va_obj);
+		sub->va_obj = NULL;
 	}
 	/* release the BLIT's pages + pins (doorbell path) */
 	vgpu_blit_unref(v, &sub->blit);

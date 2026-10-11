@@ -51,6 +51,10 @@ _Avoid_: buffer, memory, vram
 **VRAM**:
 The collective of all BOs. Emulated on system memory (shmem), not real video memory.
 
+**Managed range**:
+A VA range bound with VGPU_VM_BIND_MANAGED: one address space the CPU and the device share, where residency is decided by the access pattern rather than by the submission. A kernel launched by VGPU_PKT_LAUNCH_VA resolves its LD/ST through the submitting context's page tables and a non-resident page is migrated in on demand — the缺页 model of a CPU, on the device (CUDA calls this Unified Memory).
+_Avoid_: managed memory (a range is what is managed, not memory), UVM as a verb
+
 ### Lifecycle
 
 **Reset**:
