@@ -4,7 +4,7 @@
 CC ?= gcc
 CFLAGS := -O2 -Wall -Wextra -static -I../driver/uapi -I/usr/include/libdrm
 
-all: vgpu_test examples/saxpy examples/vgpu_smi examples/uvm_saxpy examples/faults
+all: vgpu_test examples/saxpy examples/vgpu_smi examples/uvm_saxpy examples/faults examples/dequant_kv
 
 vgpu_test: vgpu_test.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -23,7 +23,11 @@ examples/uvm_saxpy: examples/uvm_saxpy.c
 examples/faults: examples/faults.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+# the LLM-serving-shaped example: fused dequant + accumulate
+examples/dequant_kv: examples/dequant_kv.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 clean:
-	rm -f vgpu_test examples/saxpy examples/vgpu_smi examples/uvm_saxpy examples/faults
+	rm -f vgpu_test examples/saxpy examples/vgpu_smi examples/uvm_saxpy examples/faults examples/dequant_kv
 
 .PHONY: all clean

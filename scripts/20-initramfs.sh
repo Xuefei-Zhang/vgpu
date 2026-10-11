@@ -21,6 +21,10 @@ done
 cp "$ROOT/driver/vgpu.ko" "$INITDIR/root/"
 cp "$ROOT/userspace/vgpu_test" "$INITDIR/root/"
 [ -f "$ROOT/userspace/examples/saxpy" ] && cp "$ROOT/userspace/examples/saxpy" "$INITDIR/root/"
+[ -f "$ROOT/userspace/examples/dequant_kv" ] && cp "$ROOT/userspace/examples/dequant_kv" "$INITDIR/root/"
+[ -f "$ROOT/userspace/examples/vgpu_smi" ] && cp "$ROOT/userspace/examples/vgpu_smi" "$INITDIR/root/"
+[ -f "$ROOT/userspace/examples/uvm_saxpy" ] && cp "$ROOT/userspace/examples/uvm_saxpy" "$INITDIR/root/"
+[ -f "$ROOT/userspace/examples/faults" ] && cp "$ROOT/userspace/examples/faults" "$INITDIR/root/"
 [ -f "$ROOT/userspace/examples/uvm_saxpy" ] && cp "$ROOT/userspace/examples/uvm_saxpy" "$INITDIR/root/"
 [ -f "$ROOT/userspace/examples/faults" ] && cp "$ROOT/userspace/examples/faults" "$INITDIR/root/"
 cp "$ROOT/userspace/examples/vgpu_smi" "$INITDIR/root/"
@@ -120,6 +124,11 @@ echo "=== phase G: memory-semantics sync (timeline semaphore, graph) ==="
 /root/vgpu_test -g || exit 1
 echo "--- sync stats (graphs / signals / waits / events) ---"
 cat /sys/kernel/debug/vgpu/sync
+echo "=== example: fused dequant+accumulate KV (the LLM-serving shape) ==="
+/root/dequant_kv || exit 1
+echo "--- compute view after the fused kernel ---"
+cat /sys/kernel/debug/vgpu/compute
+
 echo "=== phase C: GPU virtual memory (VMID isolation + VRAM budget) ==="
 /root/vgpu_test -v || exit 1
 echo "--- vm view: per-context VA ranges, budget, evictions ---"
