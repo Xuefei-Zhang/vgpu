@@ -19,3 +19,4 @@ initramfs/root/
 # kbuild artifacts (*.cmd) and nested agent state
 *.cmd
 .omc/
+userspace/examples/dequant_kv
