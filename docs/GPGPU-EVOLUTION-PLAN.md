@@ -272,7 +272,7 @@ MMIO 布局（Phase B 引入，之后所有阶段都在其上长）：
 | G | timeline semaphore / event / 图提交 | ✅ 已完成并 guest 验证 | `b19abbf` |
 | J | vgpu-smi-lite 观测工具 | ✅ 已完成并 guest 验证 | `a71f6ba` |
 | I | RPM / DVFS / per-context 计费 | ✅ 已完成并 guest 验证 | `28d6a3f` |
-| E | 统一虚拟内存：managed VA + 引擎侧按需迁移 | ✅ 已完成并 guest 验证 | 本分支 `phase/e-uvm` |
+| E | 统一虚拟内存：managed VA + 引擎侧按需迁移 | ✅ 已完成并 guest 验证 | `dd42aa1` |
 | H | fault containment / fault buffer | ⬜ 未开始（C 已落地，无阻塞） | — |
 **已交付内容**：per-fd 多队列（每队列独立 ring + fence timeline + doorbell）、三个引擎（gfx/copy/compute）各自
 ordered workqueue + 各自 scratch、packet 格式 + VGPU_DOORBELL + 引擎侧 fetch/decode、7 指令教学 ISA +
